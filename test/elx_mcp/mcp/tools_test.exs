@@ -20,21 +20,28 @@ defmodule ElxMcp.MCP.ToolsTest do
   }
 
   alias ElxMcp.MCP.Resources
-
   alias ElxMcp.Projects
   alias ElxMcp.Tenancy
 
   setup do
     {:ok, project} = Tenancy.create_project(%{key: "MCP", name: "MCP"})
     {:ok, key, _} = Auth.create_api_key(project.id, "m@example.com", %{})
-    {:ok, epic} = Projects.create_epic(project.id, %{title: "E1", status: "to_do"})
-    {:ok, story} = Projects.create_user_story(project.id, %{title: "Story", epic_id: epic.id})
-    {:ok, ticket} = Projects.create_ticket(project.id, %{title: "T1", user_story_id: story.id})
-    {:ok, board} = Projects.create_board(project.id, %{name: "B1"})
-    {:ok, _} = Projects.create_sprint(project.id, %{name: "Sprint A", board_id: board.id})
+
+    write_scope = %ElxMcp.Auth.Scope{
+      project_id: project.id,
+      actor_email: key.email,
+      api_key_id: key.id,
+      scopes: ["project:read", "project:write"]
+    }
+
+    {:ok, epic} = Projects.create_epic(write_scope, %{title: "E1", status: "to_do"})
+    {:ok, story} = Projects.create_user_story(write_scope, %{title: "Story", epic_id: epic.id})
+    {:ok, ticket} = Projects.create_ticket(write_scope, %{title: "T1", user_story_id: story.id})
+    {:ok, board} = Projects.create_board(write_scope, %{name: "B1"})
+    {:ok, _} = Projects.create_sprint(write_scope, %{name: "Sprint A", board_id: board.id})
 
     {:ok, _} =
-      ElxMcp.Collaboration.create_comment(project.id, %{
+      ElxMcp.Collaboration.create_comment(write_scope, %{
         commentable_type: "ticket",
         commentable_id: ticket.id,
         author_email: "m@example.com",
@@ -64,20 +71,26 @@ defmodule ElxMcp.MCP.ToolsTest do
     assert response.isError == false
   end
 
-  test "list_epics returns epics", %{frame: frame} do
+  test "list_epics returns JSON shape with key/title", %{frame: frame, epic: epic} do
     assert {:reply, response, ^frame} = ListEpics.execute(%{}, frame)
     assert response.isError == false
+    text = hd(response.content)["text"]
+    {:ok, data} = Jason.decode(text)
+    assert is_list(data["epics"])
+    first = hd(data["epics"])
+    assert first["key"] == epic.key
+    assert first["title"] == "E1"
   end
 
-  test "get_epic and get_ticket", %{frame: frame, epic: epic, ticket: ticket} do
+  test "get_epic and get_ticket include keys", %{frame: frame, epic: epic, ticket: ticket} do
     assert {:reply, r1, _} = GetEpic.execute(%{key: epic.key}, frame)
     assert r1.isError == false
+    assert hd(r1.content)["text"] =~ epic.key
 
     assert {:reply, r2, _} = GetTicket.execute(%{key: ticket.key}, frame)
     assert r2.isError == false
-
-    # nested associations encoded (not dropped)
     text = hd(r2.content)["text"]
+    assert text =~ ticket.key
     assert text =~ "user_story" or text =~ ticket.title
   end
 
@@ -86,15 +99,26 @@ defmodule ElxMcp.MCP.ToolsTest do
     assert response.isError == true
   end
 
-  test "list_boards and search", %{frame: frame} do
+  test "list_tickets happy path with story filter", %{frame: frame, story: story, ticket: ticket} do
+    assert {:reply, response, _} = ListTickets.execute(%{story_key: story.key}, frame)
+    assert response.isError == false
+    text = hd(response.content)["text"]
+    {:ok, data} = Jason.decode(text)
+    assert is_list(data["tickets"])
+    assert Enum.any?(data["tickets"], &(&1["key"] == ticket.key))
+  end
+
+  test "list_boards and search exact key", %{frame: frame, epic: epic} do
     assert {:reply, r1, _} = ListBoards.execute(%{}, frame)
     assert r1.isError == false
 
-    assert {:reply, r2, _} = SearchWorkItems.execute(%{q: "Story"}, frame)
+    assert {:reply, r2, _} = SearchWorkItems.execute(%{q: epic.key}, frame)
     assert r2.isError == false
+    text = hd(r2.content)["text"]
+    assert text =~ epic.key
   end
 
-  test "list remaining tools and resource", %{frame: frame, story: story, ticket: ticket} do
+  test "list remaining tools", %{frame: frame, story: story, ticket: ticket} do
     assert {:reply, r1, _} = GetUserStory.execute(%{key: story.key}, frame)
     assert r1.isError == false
 

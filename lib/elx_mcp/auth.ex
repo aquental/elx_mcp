@@ -87,6 +87,13 @@ defmodule ElxMcp.Auth do
 
   defp emails_match?(_, _), do: false
 
+  @doc """
+  Requires `project:write` on the scope. Used at mutation boundaries.
+  """
+  def authorize_write(%Scope{} = scope) do
+    if Scope.has_scope?(scope, "project:write"), do: :ok, else: {:error, :forbidden}
+  end
+
   def revoke_api_key(%ApiKey{} = key) do
     key
     |> Ecto.Changeset.change(revoked_at: DateTime.utc_now(:microsecond))

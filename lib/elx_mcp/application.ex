@@ -1,5 +1,5 @@
 defmodule ElxMcp.Application do
-  # See https://elixir.hexdocs.pm/Application.html
+  # See https://hexdocs.pm/elixir/Application.html
   # for more information on OTP Applications
   @moduledoc false
 
@@ -7,6 +7,10 @@ defmodule ElxMcp.Application do
 
   @impl true
   def start(_type, _args) do
+    # Application process owns named ETS tables so they survive request processes.
+    :ok = ElxMcp.Auth.RateLimit.setup!()
+    :ok = ElxMcp.Auth.SessionBind.setup!()
+
     children = [
       ElxMcpWeb.Telemetry,
       ElxMcp.Repo,
@@ -17,7 +21,7 @@ defmodule ElxMcp.Application do
       ElxMcpWeb.Endpoint
     ]
 
-    # See https://elixir.hexdocs.pm/Supervisor.html
+    # See https://hexdocs.pm/elixir/Supervisor.html
     # for other strategies and supported options
     opts = [strategy: :one_for_one, name: ElxMcp.Supervisor]
     Supervisor.start_link(children, opts)

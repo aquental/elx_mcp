@@ -20,8 +20,8 @@ defmodule ElxMcp.Projects.Component do
 
   def changeset(component, attrs) do
     component
-    |> cast(attrs, [:name, :description, :lead_email, :project_id])
-    |> validate_required([:name, :project_id])
+    |> cast(attrs, [:name, :description, :lead_email])
+    |> validate_required([:name])
     |> unique_constraint([:project_id, :name])
     |> foreign_key_constraint(:project_id)
   end

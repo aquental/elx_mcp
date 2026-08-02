@@ -1,210 +1,123 @@
 # Architecture Review — ElxMCP
+**Date:** 2026-08-02
+**Score:** 74
 
-**Scope:** `lib/elx_mcp/` (tenancy, projects, collaboration, auth, mcp), `lib/elx_mcp_web/` (router, plugs), `mix.exs`  
-**Date:** 2026-08-01  
-**xref context:** ~61 files; 2 cycles; top fan-out `mcp/server.ex` (17), `projects.ex` (9)
+## Summary
 
----
+ElxMCP keeps a clear bounded-context layout (Tenancy / Auth / Projects / Collaboration / Catalog / MCP) with a thin web edge and MCP tools that consistently funnel through `Helpers.with_scope/2` into scope-filtered reads. Residual architecture debt is unchanged from the prior re-audit: dual Scope API (reads take `%Auth.Scope{}`, writes take bare `project_id`), `project:write` catalogued but never gated, `Projects` as a multi-aggregate hub (~433 LOC / 21 public fns), orphaned Component/ComponentLink surface, and two **runtime** xref cycles (Phoenix web stack + Epic↔UserStory↔Ticket associations). Ticket↔Worklog compile cycle remains fixed via one-way Worklog→Ticket and `Projects.increment_time_spent/3`. No compile-time cycles. Score holds at **74/C** — structure is sound for a read-first MCP status server; write-path and god-context risks block a B-grade.
 
-## Architecture score: **67 / 100**
+## Score breakdown
 
-| Factor | Notes | Impact |
-|--------|--------|--------|
-| Context split | Tenancy / Auth / Projects / Collaboration / Catalog / MCP is directionally sound | + |
-| Scope usage | Reads take `%Auth.Scope{}`; writes take bare `project_id` — inconsistent, weakens 1.8 pattern | − |
-| Boundary purity | Cross-context schema edges + direct `Repo` on foreign schema | − |
-| Cycles | Schema-level Ticket ↔ Worklog (and graph cycles from associations) | − |
-| API surface | Projects large; Collaboration/Projects writes half-wired; no update/delete | − |
-| Web layer | Thin router + MCPAuth; no domain LiveViews | + |
-| MCP layer | Tools go through contexts (good); Server is a fan-out registry | ~ |
+| Criterion | Max | Score | Notes |
+|-----------|-----|-------|-------|
+| Context boundaries | 25 | 17 | Tenancy/Auth/Projects/Collaboration/Catalog/MCP split is clear; Collaboration→Projects for time_spent is correct; dual Scope API + ungated writes + polymorphic create without entity ownership checks hold the score down |
+| Naming | 15 | 10 | Consistent `ElxMcp.*` / MCP Tools/Resources names; collision `Projects` (work items) vs `Tenancy.Project` (tenant) remains the main confusion |
+| Fan-out | 15 | 13 | Tools/resources → Helpers → contexts (good); Server is registration hub (17 out); Projects 18 in / Helpers 17 in are expected concentrators |
+| API surface | 15 | 9 | Projects 21 public (under 30 flag) but multi-aggregate + dead Component surface; Collaboration 6 asymmetric; almost no update/delete |
+| No cycles | 15 | 12 | **0 compile cycles**; 2 runtime cycles (framework Layouts↔Router; Epic↔UserStory↔Ticket). Worklog cycle fixed |
+| Folder structure | 15 | 13 | Standard context dirs + `mcp/{tools,resources}`; plugs under web; Component schemas present but unhooked from full API |
+| **Total** | **100** | **74** | Same residual class as 2026-08-01 re-audit |
 
----
+### Public function counts (context modules)
 
-## Issues (report only)
+| Module | Public `def` | Lines | Bloat flag (>30) |
+|--------|--------------|-------|------------------|
+| `ElxMcp.Projects` | **21** | 433 | No (near multi-aggregate limit) |
+| `ElxMcp.Collaboration` | **6** | 85 | No |
+| `ElxMcp.Auth` | **6** | 132 | No |
+| `ElxMcp.Tenancy` | **5** | 46 | No |
+| `ElxMcp.Catalog` | **12** | 29 | No (allowlist module) |
 
-### 1. Cross-context schema cycle: Projects ↔ Collaboration
+### Xref cycles (`mix xref graph --format cycles`)
 
-**Where:** `Projects.Ticket` `has_many :worklogs, ElxMcp.Collaboration.Worklog`; `Collaboration.Worklog` `belongs_to :ticket, Projects.Ticket`.
+| Label | Result |
+|-------|--------|
+| Default / runtime | **2 cycles** |
+| `--label compile` | **No cycles** |
 
-**Why it matters:** This is a compile-time / xref cycle between contexts. Ownership is unclear: time tracking lives in Collaboration but is embedded in the Projects ticket graph (`get_ticket` preloads `:worklogs`).
+1. **Runtime length 4 (framework):** `layouts.ex` → `page_controller.ex` → `endpoint.ex` → `router.ex` (standard Phoenix web cycle).
+2. **Runtime length 3 (same-context assocs):** `projects/epic.ex` ↔ `user_story.ex` ↔ `ticket.ex` (`has_many`/`belongs_to` mutual refs).
 
-**Fix direction:** Prefer ID-only references from Collaboration → ticket_id without reverse `has_many` on Ticket; or move Worklog under Projects if time is part of the work-item aggregate. Load worklogs via `Collaboration` API, not Ticket preloads.
-
----
-
-### 2. Collaboration reaches into Projects schemas via Repo
-
-**Where:** `Collaboration.create_worklog/3` runs `from(t in Ticket, ...)` / `repo.update_all` on `ElxMcp.Projects.Ticket`.
-
-**Why it matters:** Violates “contexts own their data.” Collaboration mutates Projects aggregate fields (`time_spent_seconds`) without going through `Projects`.
-
-**Fix direction:** `Projects.inc_time_spent/3` (or Multi owned by Projects that accepts a worklog changeset), or a single Projects function that records worklog + increments.
-
----
-
-### 3. Scope API is split-brain (reads vs writes)
-
-**Where:**
+### Scope pattern (reads vs writes)
 
 | Context | Reads | Writes |
 |---------|-------|--------|
-| Projects | `%Scope{}` first | `project_id` first (`create_*`) |
-| Collaboration | `%Scope{}` | `project_id` |
-| Auth / Tenancy | n/a | `project_id` |
+| Projects | `%Scope{}` first (`list_*`, `get_*`, `search_*`, `status_summary`) | bare `project_id` (`create_*`, `update_ticket_parent`, `increment_time_spent`) |
+| Collaboration | `%Scope{}` (`list_comments`, `list_changelog`) | bare `project_id` (`create_*`, `record_changelog`) |
+| Auth / Tenancy | n/a | bare `project_id` / unscoped admin list |
 
-Moduledoc on `Projects` explicitly allows “`%Scope{}` **or** `project_id`.”
+Tenant isolation on **reads** is consistent (`where: project_id == ^scope.project_id`). **Writes** trust the caller-supplied `project_id` and do not thread actor/scopes; `project:write` is never checked.
 
-**Why it matters:** Phoenix 1.8 convention is scope-first for all tenant ops. Bare `project_id` invites callers to skip actor/scopes and makes authorization optional at the API boundary. Mix tasks and seeds are fine with internal helpers; public context API should not dual-path.
-
-**Fix direction:** `create_*(%Scope{}, attrs)`; keep `project_id`-only helpers private or in admin/mix modules.
-
----
-
-### 4. `project:write` is catalogued but not an architectural gate
-
-**Where:** `Catalog.scopes/0` includes `project:write`; `Auth.verify_api_key/2` requires `"project:read"` only; no write path checks `Scope.has_scope?(..., "project:write")`.
-
-**Why it matters:** Scope model is half-designed. Write functions accept any `project_id` with no actor/scopes. Future HTTP/MCP write tools will re-implement auth inconsistently.
-
-**Fix direction:** Enforce scopes in context (or a single authorize helper) on every mutation; decide if verify should require read, write, or either.
-
----
-
-### 5. Projects is a multi-aggregate context (fan-out 9, ~18 public fns)
-
-**Public surface (`Projects`):**  
-`create_board`, `list_boards`, `create_sprint`, `list_sprints`, `get_sprint`, `create_component`, `create_epic`, `list_epics`, `get_epic`, `create_user_story`, `list_user_stories`, `get_user_story`, `create_ticket`, `list_tickets`, `get_ticket`, `search_work_items`, `status_summary` — **17 public functions**, one module owns boards, sprints, components, epics, stories, tickets, search, and rollups.
-
-**Why it matters:** Cohesion is “Jira domain,” not a single aggregate. Line count is under god-context (~364), but growth will force a split under pressure. Fan-out 9 is second only to MCP Server.
-
-**Fix direction:** Split when write/update APIs land: e.g. `Projects.Boards`, `Projects.WorkItems` (epic/story/ticket), keep facade `Projects` if MCP needs a stable entrypoint.
-
----
-
-### 6. Incomplete / dead domain surface
-
-| Item | Evidence |
-|------|----------|
-| No update/delete | No `update_*` / `delete_*` in contexts |
-| Components orphaned | `Component` / `ComponentLink` schemas; only `create_component/2`; no list/link/get |
-| Collaboration writes unused by app layer | `create_comment`, `create_attachment`, `create_worklog`, `record_changelog` exist; MCP tools are read-only |
-| Changelog never produced from domain events | `record_changelog` is fire-and-forget API; Projects mutations do not call it |
-
-**Why it matters:** Schema/API surface implies a fuller product than the architecture delivers. Dead modules increase coupling noise (xref, migrations, mental load).
-
-**Fix direction:** Wire changelogs into mutations via Multi, expose or delete ComponentLink until needed, mark write APIs as internal if MCP stays read-only.
-
----
-
-### 7. Naming collision: `Projects` vs `Tenancy.Project`
-
-**Where:** Context `ElxMcp.Projects` = work items; schema `ElxMcp.Tenancy.Project` = tenant.
-
-**Why it matters:** Everyday language collapses both to “project.” Call sites and docs already say “project-scoped” for both tenant id and work-item context.
-
-**Fix direction:** Rename context to `WorkItems` / `Issues` / `Tracker`, or rename tenant to `Workspace`/`Tenant` if product language allows. Document the distinction in moduledocs until rename.
-
----
-
-### 8. Schemas cast tenant and association FKs
-
-**Where:** e.g. `Projects.Ticket.changeset/2` casts `:project_id`, `:user_story_id`, `:parent_ticket_id`, `:board_id`, `:sprint_id` (similar patterns on other schemas).
-
-**Why it matters:** Contexts set these fields, but casting them means any leak of raw attrs can re-tenant or re-parent. Architecture guideline: programmatically set FKs outside `cast`.
-
-**Fix direction:** Drop FKs from `cast`; `put_change` / struct assignment in context only.
-
----
-
-### 9. MCP.Server concentrator (fan-out 17)
-
-**Where:** `ElxMcp.MCP.Server` registers 12 tools + 5 resources via `component/1`.
-
-**Why it matters:** Expected for Anubis component registration; not a logic cycle. Still a single compile-time hub—every new tool edits Server.
-
-**Fix direction:** Acceptable for now; if tool count grows, group by domain modules or codegen/registry list. Prefer keeping tools thin (already mostly true).
-
----
-
-### 10. Polymorphic Collaboration IDs without entity ownership checks (write path)
-
-**Where:** `create_comment` / `create_attachment` / `record_changelog` accept type+id (or free attrs) without verifying the target exists in `project_id`. MCP `list_comments` resolves keys via Projects (good); create path does not.
-
-**Why it matters:** Cross-tenant or dangling entity references if writes open to untrusted callers.
-
-**Fix direction:** Resolve entity through Projects (by key/id + scope) before insert.
-
----
-
-### 11. Auth API surface small but authorization mixed into verification
-
-**Public Auth:** `create_api_key/3`, `verify_api_key/2`, `revoke_api_key/1`, `get_api_key!/1`, `list_api_keys/1` (~5).
-
-**Issue:** `verify_api_key` embeds `"project:read" in key.scopes` — authentication and minimum authorization are fused. Write-only or future scopes cannot authenticate.
-
-**Fix direction:** Verify key+email+active only; check scopes at tool/context boundary via `Scope.has_scope?/2`.
-
----
-
-### 12. Collaboration public API is write-heavy, read-thin
-
-**Public:** `create_comment`, `list_comments`, `create_attachment`, `create_worklog`, `record_changelog`, `list_changelog` — **6 functions**.
-
-No list attachments, no list worklogs, no get-by-id. Asymmetric vs schema set. Acceptable if intentional MVP; otherwise incomplete boundary.
-
----
-
-## Clean areas (one line each)
-
-- **Tenancy:** Small, cohesive (`Project` + issue key counter); no reverse deps into Projects/Collaboration logic.
-- **Catalog:** Pure allowlists; appropriate shared leaf; no Repo.
-- **Auth packaging:** `ApiKey` / `Scope` / `RateLimit` layout is clear; web only depends on Auth for MCP.
-- **Web boundary:** Router + `MCPAuth` + CORS only; no domain LiveViews; business logic stays out of controllers.
-- **MCP tools:** Call contexts (`Projects` / `Collaboration`), not `Repo`; Helpers centralize scope extraction.
-- **mix.exs:** Standard Phoenix 1.8 app layout, single OTP app, sensible `precommit` alias; no multi-app umbrella complexity.
-- **Intra-Projects associations:** Epic ↔ UserStory ↔ Ticket cycles are same-context graphs (expected), not boundary violations.
-
----
-
-## Dependency sketch (intended vs actual)
+### Cross-context call graph (who → whom)
 
 ```
-Intended:
-  Web/MCP → Auth, Projects, Collaboration, Tenancy
-  Projects → Tenancy, Auth.Scope, Catalog
-  Collaboration → Auth.Scope, Catalog  (+ ticket_id only)
-  Auth → Tenancy, Catalog
+MCP tools/resources → MCP.Helpers → Auth.Scope
+                    → Projects (reads)
+                    → Collaboration (list_comments, list_changelog)
+                    → Projects (entity resolve for collab lists)
 
-Actual extras:
-  Collaboration → Projects.Ticket (query + update)
-  Projects.Ticket → Collaboration.Worklog (has_many)
-  Projects → Tenancy.next_issue_key (OK)
+Collaboration → Projects.increment_time_spent/3  (write handoff, OK)
+Projects      → Tenancy.next_issue_key/1         (key gen, OK)
+Auth          → Catalog.scopes/0                 (allowlist, OK)
+Schemas       → Tenancy.Project (belongs_to)     (FK, expected)
+Worklog       → Projects.Ticket (belongs_to)     (one-way, cycle-safe)
 ```
 
----
+No reverse cross-context Repo leaks (Collaboration no longer mutates Ticket via Repo).
 
-## API surface summary
+### Fan-out: MCP → Helpers → contexts
 
-| Context | Public fns (approx) | Assessment |
-|---------|---------------------|------------|
-| **Projects** | 17 | Large multi-aggregate; split candidate |
-| **Auth** | 5 (+ Scope helpers) | Right size; verify/authz coupling |
-| **Collaboration** | 6 | Small; incomplete reads; write boundary soft |
-| **Tenancy** | 5 | Right size |
-| **Catalog** | ~10 getters | Fine as constants module |
+- **12 tools + 5 resources** registered on `ElxMcp.MCP.Server`.
+- Tools use `Helpers.with_scope/2` + context calls; resources use `Helpers.scope_from_frame/1`.
+- Helpers also rebuilds Scope from flat assigns as fallback (dual path: `current_scope` preferred; `MCPAuth` sets both).
 
----
+## Issues found
 
-## Priority order if fixing architecture
+### P1
 
-1. Break Ticket ↔ Worklog ownership cycle; stop Collaboration from updating Ticket via Repo.  
-2. Unify context API on `%Scope{}` for tenant mutations; enforce `project:write` where applicable.  
-3. Stop casting tenant/association FKs on schemas.  
-4. Either wire Component/ComponentLink/changelog into real flows or quarantine/remove.  
-5. Plan Projects split before update/delete APIs land.
+- `lib/elx_mcp/projects.ex:4-5,15-19` (and all `create_*` / `update_ticket_parent` / `increment_time_spent`) — **Scope dual API: writes take bare `project_id`** while moduledoc still allows “`%Scope{}` or `project_id`.” Callers can skip actor/scopes entirely. — Make mutations `create_*(%Scope{}, attrs)`; keep bare-id helpers private or mix/admin-only.
 
----
+- `lib/elx_mcp/collaboration.ex:13-17,32-36,38-60,62-71` — **Same dual API on Collaboration writes**; create paths never see `%Scope{}`. — Align with Scope-first mutations; resolve entity ownership under tenant before insert.
 
-## Score rationale (brief)
+- `lib/elx_mcp/catalog.ex:13` + `lib/elx_mcp/auth.ex:58` + absence of write checks — **`project:write` is catalogued but never enforced**; `verify_api_key/2` only requires `"project:read"`. Authn fused with minimum authz. — Authenticate key+email only; enforce `Scope.has_scope?/2` at tool/context mutation boundary.
 
-Starts from a healthy baseline (~80) for clear folders and thin web. Deducted for: cross-context cycle and Repo reach-in (−8), scope dual API + unused write scope (−6), Projects agglomeration / incomplete surfaces (−5), FK cast / naming friction (−4). **67** reflects “good skeleton, soft boundaries under load.”
+### P2
+
+- `lib/elx_mcp/projects.ex` (full module, ~433 LOC / 21 public) — **Multi-aggregate god-context** (boards, sprints, components, epics, stories, tickets, search, status). Under 30-fn flag but will force a painful split when update/delete expands. — Split before write surface grows: e.g. `Projects.Boards` / `Projects.WorkItems`, optional facade for MCP.
+
+- `lib/elx_mcp/projects/component.ex`, `lib/elx_mcp/projects/component_link.ex`, `lib/elx_mcp/projects.ex:67-71` — **Dead/incomplete Component surface**: schemas + only `create_component/2`; no list/get/link API; `ComponentLink` unused outside its own module. — Wire full API or remove until needed.
+
+- `lib/elx_mcp/projects/epic.ex:41`, `user_story.ex:47`, `board.ex:24`, `sprint.ex:29`, `component.ex:23`, `collaboration/{comment,attachment,worklog,changelog}.ex` cast lists — **Tenant/association FKs still in `cast`** (Ticket correctly uses `put_change` for `:project_id`/`:key` only). — Drop programmatic FKs from `cast`; set via context `put_change` only.
+
+- `lib/elx_mcp/collaboration.ex:13-36,62-71` — **Polymorphic writes lack entity ownership checks** (type+id accepted without verifying target exists in `project_id`). MCP list path resolves keys via Projects (good); create path does not. — Resolve entity through Projects under scope before insert.
+
+- `lib/elx_mcp/auth.ex:58` — **Authentication fused with `"project:read"` gate** — keys without read cannot authenticate; write-only scopes impossible. — Separate authn from scope checks (`Helpers` already re-checks read for tools).
+
+### P3
+
+- Naming: context `ElxMcp.Projects` vs schema `ElxMcp.Tenancy.Project` — everyday language collapses both to “project.” — Rename context to `WorkItems`/`Tracker` or tenant to `Workspace`/`Tenant`; document until rename.
+
+- `lib/elx_mcp/collaboration.ex` public API — **Write-heavy, read-thin** (create attachment/worklog; no list/get for those). — Add list APIs or mark write helpers internal if MCP stays read-only.
+
+- Domain mutations never call `record_changelog` — changelog is fire-and-forget / test-only; no domain event wiring. — Multi-insert changelog on mutations if audit trail is a product goal.
+
+- `lib/elx_mcp/mcp/server.ex:12-30` — Server concentrator (xref out=17). Acceptable for Anubis registration; every new tool edits Server. — Registry list or domain grouping if tool count grows.
+
+- `lib/elx_mcp/projects/epic.ex` ↔ `user_story.ex` ↔ `ticket.ex` — **Runtime association cycle** (same-context). Not a boundary violation; keeps `mix xref` noisy. — Accept, or break with string module names / drop reverse `has_many` if unused.
+
+- `lib/elx_mcp_web/components/layouts.ex` ↔ router/endpoint/page_controller — **Framework Phoenix runtime cycle**. Do not “fix” unless upgrading framework patterns.
+
+- Almost no general `update_*` / `delete_*` on work items (only `update_ticket_parent`) — API implies fuller product than delivered. — Explicitly document read-first MCP scope or implement full CRUD under Scope.
+
+## Clean areas
+
+- Context directory layout matches domain names; schemas live under owning context folders.
+- MCP tools/resources stay thin and call contexts (no direct Repo in tools).
+- `MCPAuth` assigns `%Scope{}` as `current_scope` and strips key/email headers after verify.
+- Collaboration→Projects handoff for worklog time_spent (no cross-schema Repo mutation).
+- Ticket no longer `has_many :worklogs` — compile cycle Ticket↔Worklog remains fixed.
+- Catalog centralizes allowlists; Auth validates scopes against Catalog on key create.
+- Application tree is minimal and correct: Telemetry, Repo, DNSCluster, PubSub, MCP.Server, Endpoint.
+- Zero **compile-time** xref cycles.
+- Router is thin: browser home + `/mcp` StreamableHTTP forward with CORS + MCPAuth.
+- Read queries consistently pin `project_id` with `^` from Scope.

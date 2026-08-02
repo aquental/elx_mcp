@@ -21,7 +21,7 @@ defmodule ElxMcp.MCP.Tools.ListBoards do
       data =
         Projects.list_boards(scope, limit: limit) |> Enum.map(&Helpers.encode_struct/1)
 
-      Helpers.emit_tool("list_boards", scope.project_id, start, :ok)
+      Helpers.emit_tool("list_boards", scope, start, :ok, params)
       Helpers.json_reply(frame, %{boards: data})
     end)
   end

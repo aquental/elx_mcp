@@ -22,11 +22,11 @@ defmodule ElxMcp.MCP.Tools.ListUserStories do
 
       with {:ok, opts} <- build_opts(scope, params) do
         data = Projects.list_user_stories(scope, opts) |> Enum.map(&Helpers.encode_struct/1)
-        Helpers.emit_tool("list_user_stories", scope.project_id, start, :ok)
+        Helpers.emit_tool("list_user_stories", scope, start, :ok, params)
         Helpers.json_reply(frame, %{user_stories: data})
       else
         {:error, :not_found} ->
-          Helpers.emit_tool("list_user_stories", scope.project_id, start, :not_found)
+          Helpers.emit_tool("list_user_stories", scope, start, :not_found, params)
           Helpers.error_reply(frame, "Epic not found / Épico não encontrado")
       end
     end)

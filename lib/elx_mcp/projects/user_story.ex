@@ -34,7 +34,6 @@ defmodule ElxMcp.Projects.UserStory do
   def changeset(story, attrs) do
     story
     |> cast(attrs, [
-      :key,
       :title,
       :description,
       :status,
@@ -44,12 +43,12 @@ defmodule ElxMcp.Projects.UserStory do
       :reporter_email,
       :labels,
       :metadata,
-      :project_id,
       :epic_id,
       :board_id,
       :sprint_id
     ])
-    |> validate_required([:key, :title, :project_id])
+    # :key and :project_id set via put_change in context (not mass-assigned)
+    |> validate_required([:title])
     |> validate_inclusion(:status, Catalog.statuses())
     |> validate_inclusion(:priority, Catalog.priorities())
     |> unique_constraint(:key)

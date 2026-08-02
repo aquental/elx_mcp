@@ -24,14 +24,13 @@ defmodule ElxMcp.Collaboration.Worklog do
   def changeset(worklog, attrs) do
     worklog
     |> cast(attrs, [
-      :project_id,
-      :ticket_id,
-      :author_email,
       :time_spent_seconds,
       :started_at,
       :note
     ])
-    |> validate_required([:project_id, :ticket_id, :author_email, :time_spent_seconds])
+    # :project_id, :ticket_id, :author_email set via put_change in context
+    |> validate_required([:time_spent_seconds])
     |> validate_number(:time_spent_seconds, greater_than: 0)
+    |> foreign_key_constraint(:project_id)
   end
 end

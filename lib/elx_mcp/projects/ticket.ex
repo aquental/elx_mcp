@@ -48,7 +48,6 @@ defmodule ElxMcp.Projects.Ticket do
       :reporter_email,
       :original_estimate_seconds,
       :remaining_estimate_seconds,
-      :time_spent_seconds,
       :labels,
       :metadata,
       :user_story_id,
@@ -56,7 +55,7 @@ defmodule ElxMcp.Projects.Ticket do
       :board_id,
       :sprint_id
     ])
-    # :key and :project_id set via put_change in context (not mass-assigned)
+    # :key, :project_id, :time_spent_seconds set via put_change / increment_time_spent
     |> validate_required([:title, :user_story_id])
     |> validate_inclusion(:type, Catalog.ticket_types())
     |> validate_inclusion(:status, Catalog.statuses())

@@ -23,11 +23,11 @@ defmodule ElxMcp.MCP.Tools.ListTickets do
 
       with {:ok, opts} <- build_opts(scope, params) do
         data = Projects.list_tickets(scope, opts) |> Enum.map(&Helpers.encode_struct/1)
-        Helpers.emit_tool("list_tickets", scope.project_id, start, :ok)
+        Helpers.emit_tool("list_tickets", scope, start, :ok, params)
         Helpers.json_reply(frame, %{tickets: data})
       else
         {:error, :not_found} ->
-          Helpers.emit_tool("list_tickets", scope.project_id, start, :not_found)
+          Helpers.emit_tool("list_tickets", scope, start, :not_found, params)
           Helpers.error_reply(frame, "User story not found / Story não encontrada")
       end
     end)

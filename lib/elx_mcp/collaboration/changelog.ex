@@ -23,16 +23,15 @@ defmodule ElxMcp.Collaboration.Changelog do
   def changeset(changelog, attrs) do
     changelog
     |> cast(attrs, [
-      :project_id,
       :entity_type,
       :entity_id,
-      :actor_email,
       :field,
       :old_value,
-      :new_value,
-      :inserted_at
+      :new_value
     ])
-    |> validate_required([:project_id, :entity_type, :entity_id, :field, :inserted_at])
+    # :project_id, :actor_email, :inserted_at set via put_change in context
+    |> validate_required([:entity_type, :entity_id, :field])
     |> validate_inclusion(:entity_type, Catalog.entity_types())
+    |> foreign_key_constraint(:project_id)
   end
 end

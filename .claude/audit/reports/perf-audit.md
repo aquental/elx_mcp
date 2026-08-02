@@ -1,203 +1,154 @@
 # Performance Audit — ElxMCP
 
-**Date:** 2026-08-01  
-**Scope:** `lib/elx_mcp/projects.ex`, `collaboration.ex`, `auth.ex`, migrations, MCP list/search tools  
-**Performance score:** **58 / 100**
-
-Report lists **issues only**. Severity: P1 (high impact under growth/load), P2 (moderate), P3 (lower / edge).
-
----
-
-## P1 — `status_summary/2` query fan-out + over-fetch
-
-**Where:** `lib/elx_mcp/projects.ex` (`status_summary`, `recent_items`, `count_by_status`)  
-**Callers:** `MCP.Tools.ProjectStatus`, `MCP.Resources.ProjectStatus`
-
-Each call issues **7 DB round-trips**:
-
-1. `count_by_status(Epic)`  
-2. `count_by_status(UserStory)`  
-3. `count_by_status(Ticket)`  
-4. `list_epics(..., limit: N)` — full rows  
-5. `list_user_stories(..., limit: N)` — full rows  
-6. `list_tickets(..., limit: N)` — full rows  
-7. `list_tickets(..., status: "in_review", limit: N)` — full rows  
-
-`recent_items/2` loads **3× N** full work-item rows, maps to thin summaries in Elixir, then sorts/`Enum.take(N)`. Payload and IO are ~3× larger than needed; merge-sort of “global recent” should be one SQL path (or three `select` of only key/title/status/updated_at + single sort).
-
-Resource URI `project://status` always hits this path with no knobs to skip counts or recent.
+**Date:** 2026-08-02  
+**Score:** 72  
+**Grade:** C  
+**Scope:** `lib/elx_mcp/projects.ex`, schemas, `collaboration.ex`, `mcp/` helpers+tools, `auth` rate limit, `priv/repo/migrations/`  
+**Baseline:** 74/C (same residual class; re-scored against current code only)
 
 ---
 
-## P1 — Domain list APIs unbounded when `limit` omitted
+## Summary
 
-**Where:** `list_epics/2`, `list_user_stories/2`, `list_tickets/2`  
-**Helper:** `maybe_limit(query, nil)` → **no SQL `LIMIT`**
-
-MCP tools default `limit: 50` (max 100), but any direct/context call without `:limit` returns the **entire project table**. Defaults should hard-cap (e.g. 50–100, max 200) like boards/sprints/comments.
+ElxMCP is an MCP read API over multi-tenant work items. There is **no classic N+1** (`Repo` inside `Enum.map` over query results). List paths have **default/max limits**, tenant-scoped filters, and useful **list indexes**. Residual risk is concentrated in three areas: **leading-wildcard `ILIKE` search across three tables** (no FTS/trgm), **unbounded `has_many` preloads on `get_*`**, and **list tools that only support `limit`** (no offset/cursor) while encoding full schemas. Auth uses an efficient **ETS fixed-window** limiter (single-node, no bucket GC). No heavy LiveViews → streams N/A with partial credit.
 
 ---
 
-## P1 — `search_work_items/3`: leading-wildcard `ILIKE` × 3 tables
+## Score breakdown
 
-**Where:** `Projects.search_work_items/3`  
-**Caller:** `MCP.Tools.SearchWorkItems`
-
-```elixir
-pattern = "%#{escape_like(q)}%"
-# three queries: Epic | UserStory | Ticket
-ilike(key | title | description, ^pattern)
-```
-
-Issues:
-
-| Issue | Impact |
-|--------|--------|
-| Leading `%` | Cannot use B-tree indexes; sequential scan per table |
-| `description` (`:text`) in OR | Forces large TOAST/heap reads |
-| Three sequential queries | Latency ≈ sum of three scans |
-| Per-table `limit` then `Enum.take(limit)` | Can pull up to **3× limit** rows before merge |
-| Domain `limit` not capped | MCP max 50; domain accepts any integer |
-
-No `pg_trgm` / GIN, no `tsvector`/full-text, no key-prefix fast path when `q` looks like an issue key.
+| Category | Max | Score | Notes |
+|----------|-----|-------|--------|
+| N+1 / multi-query | 30 | 25 | No Enum→Repo loops on reads; cycle walk O(depth); status_summary 7 sequential RTTs |
+| Indexes | 20 | 14 | Strong `project_id`+status/updated_at/assignee; no search/trgm; weak collab composites |
+| Preloads | 15 | 6 | Unbounded `:user_stories` / `:tickets` / `:subtasks` on get_*; list resolve still full get_* |
+| GenServer / ETS | 15 | 12 | ETS rate limit is fine; no process bottleneck; no bucket cleanup; sync `last_used` write |
+| LiveView streams | 10 | 8 | N/A (no collection LiveViews); partial credit |
+| SELECT * / payload | 10 | 5 | Search/status slim `select`; lists/get encode full rows (+ assocs) |
+| **Total** | **100** | **72** | |
 
 ---
 
-## P1 — Unbounded association preloads on `get_*`
+## Issues found
 
-**Where:**
+### P1
 
-| Function | Preload | Risk |
-|----------|---------|------|
-| `get_epic/2` | `:user_stories` | All stories for epic, no limit |
-| `get_user_story/2` | `:tickets`, `:epic` | All tickets for story |
-| `get_ticket/2` | `:user_story`, `:subtasks`, `:worklogs` | All subtasks + worklogs |
+1. **Leading-`%` ILIKE search × 3 tables (no FTS / trgm)**  
+   - `lib/elx_mcp/projects.ex:246-283` (`search_work_items/3`)  
+   - Caller: `lib/elx_mcp/mcp/tools/search_work_items.ex:21`  
+   - Pattern `"%…%"` on `key | title | description` for epics, stories, tickets → B-tree unusable; text OR forces heap/TOAST reads; three sequential scans; per-table `limit` then `Enum.take` (up to 3× rows, no ranking).  
+   - No `pg_trgm` GIN, no `tsvector`, no exact/prefix key fast path.
 
-MCP `get_*` tools and resources return these full graphs. Large epics/stories → large memory + JSON encode cost (`Helpers.encode_struct`).
+2. **Unbounded association preloads on `get_*`**  
+   - `get_epic/2` → `Repo.preload(epic, [:user_stories], …)` — `projects.ex:105`  
+   - `get_user_story/2` → `[:tickets, :epic]` — `projects.ex:159`  
+   - `get_ticket/2` → `[:user_story, :subtasks]` — `projects.ex:242`  
+   - MCP tools + resources encode full graph via `Helpers.encode_struct` (`get_epic.ex`, `get_user_story.ex`, `get_ticket.ex`, `mcp/resources/{epic,user_story,ticket}.ex`). Large epics/stories → memory + JSON without child cap.
 
-`in_parallel: false` is fine; the problem is **no limit / no select subset**.
+3. **Comments / changelog resolve still loads full `get_*` (+ preloads) for `.id` only**  
+   - `lib/elx_mcp/mcp/tools/list_comments.ex:39-58`  
+   - `lib/elx_mcp/mcp/tools/list_changelog.ex:40-59`  
+   - Uses `Projects.get_epic` / `get_user_story` / `get_ticket` instead of `get_epic_id` / `get_user_story_id` (and no `get_ticket_id`). Wastes association loads every list call.
 
----
+### P2
 
-## P1 — Entity resolve over-fetches via `get_*` (ID-only need)
+4. **`status_summary/2` — 7 sequential round-trips**  
+   - `lib/elx_mcp/projects.ex:289-354`  
+   - Callers: `mcp/tools/project_status.ex:22`, `mcp/resources/project_status.ex:22`  
+   - 3× `count_by_status` + 3× `recent_rows` + 1× `recent_tickets("in_review")`. Row shapes are slim (`select` maps); bottleneck is RTT fan-out, not payload. No parallelization / single CTE.
 
-**Where:**
+5. **List APIs: limit only — no offset/cursor pagination**  
+   - Domain: `list_epics` `projects.ex:89-97`, `list_user_stories` `:141-151`, `list_tickets` `:223-234`, `list_boards` `:21-29`, `list_sprints` `:42-52`, `list_comments` `collaboration.ex:19-29`, `list_changelog` `:73-84`  
+   - MCP list tools expose `limit` only. Clients cannot page past the first window.
 
-- `MCP.Tools.ListUserStories` → `get_epic` for `epic_key` (only needs `id`)  
-- `MCP.Tools.ListTickets` → `get_user_story` for `story_key` (only needs `id`)  
-- `MCP.Tools.ListComments` / `ListChangelog` → `get_epic` / `get_user_story` / `get_ticket` for entity id  
+6. **List payloads are full schemas (SELECT *)**  
+   - MCP list tools → `Helpers.encode_struct/1` on full Ecto structs (e.g. `list_epics.ex:28`, `list_tickets.ex:25`, `list_user_stories.ex:24`).  
+   - No list projection (`key/title/status/priority/updated_at`); includes `description`, `metadata`, labels, estimates.
 
-Each resolution preloads full associations (see above) then discards them. Under heavy list-by-key usage this multiplies IO for zero product value.
+7. **`list_changelog` domain limit uncapped**  
+   - `lib/elx_mcp/collaboration.ex:74` — `Keyword.get(opts, :limit, 50)` without `min(..., max)`.  
+   - MCP schema caps at 100 (`list_changelog.ex:15`); direct domain callers can pass arbitrary limit. Contrast `list_comments` (`min(200)` at `collaboration.ex:20`).
 
-**Fix pattern:** lightweight `get_*_id_by_key/2` (single column select, no preload).
+8. **`list_comments` MCP has no limit parameter**  
+   - `lib/elx_mcp/mcp/tools/list_comments.ex:13-16` schema; always domain default 100 / max 200. No tool-level pagination control.
 
----
+9. **Auth `touch_last_used` on request path**  
+   - `lib/elx_mcp/auth.ex:60`, `119-131`  
+   - 60s debounce + `update_all` by id. Still: sync write when debounce fires; read-then-write race under concurrency; no SQL gate `WHERE last_used_at IS NULL OR last_used_at < ^cutoff`.
 
-## P2 — Missing indexes for common ORDER BY / filter paths
+10. **Index gaps vs query shapes**  
+    - Present (good): `(project_id, status)` epics/stories/tickets; `(project_id, updated_at)` + assignee composites (`20260802000000_add_list_query_indexes.exs`); FK indexes on epic_id, user_story_id, parent_ticket_id, sprint_id.  
+    - Missing:  
+      - Search: trgm/GIN or FTS on title/description  
+      - Comments: composite `(project_id, commentable_type, commentable_id, inserted_at)` — current `comments:project_id` + `(commentable_type, commentable_id)` (`create_project_domain.exs:188-189`)  
+      - Changelogs: same pattern (`:244-245`)  
+      - Sprints: tenant+status or tenant+`inserted_at` (only bare `sprints:status` at `:53`)  
+      - Tickets type filter: prefer `(project_id, type)` over bare `tickets:type` (`:153`)
 
-**Migration:** `priv/repo/migrations/20260801200000_create_project_domain.exs`
+11. **Rate limiter ETS: no window GC; setup on every check; single-node**  
+    - `lib/elx_mcp/auth/rate_limit.ex:12-50`  
+    - Atomic `update_counter` is good. Old `{key, bucket}` tuples never deleted → unbounded ETS growth. `setup!()` on every `check/2`. Documented not multi-node-safe. Table created ad-hoc (not under Application supervision).
 
-Present (good): `(project_id, status)` on epics/stories/tickets; unique `key`; FKs.
+### P3
 
-**Missing relative to actual queries:**
+12. **Parent-cycle walk O(depth) queries**  
+    - `lib/elx_mcp/projects.ex:375-394` — one `Repo.get_by(Ticket, …)` per ancestor hop on create/parent update. Prefer recursive CTE if depth grows.
 
-| Query pattern | Suggested index |
-|---------------|-----------------|
-| `order_by: [desc: updated_at]` on epics/stories/tickets (`list_*`, `recent_items`) | `(project_id, updated_at DESC)` |
-| `maybe_filter_assignee` on stories/tickets | `(project_id, assignee_email)` or `(project_id, assignee_email, status)` |
-| `list_sprints` by `project_id` + optional `status` + `order_by inserted_at` | `(project_id, status)` or `(project_id, inserted_at DESC)` (standalone `status` index is weak) |
-| `list_tickets` type filter with project | Prefer `(project_id, type)` over bare `type` |
-| Comments: `project_id AND commentable_type AND commentable_id` | Composite `(project_id, commentable_type, commentable_id)` (or `(commentable_type, commentable_id, project_id)`) instead of two partial indexes alone |
-| Changelogs: same pattern + `order_by inserted_at desc` | `(project_id, entity_type, entity_id, inserted_at DESC)` or `(entity_type, entity_id, inserted_at DESC)` |
+13. **`ensure_same_project/3` loads full row for existence**  
+    - `lib/elx_mcp/projects.ex:356-363` — used on create paths. `exists` / `select: true` cheaper under bulk create.
 
-Without `(project_id, updated_at)`, list + recent paths sort with index on status only when filtered, else file sort after project filter.
-
-Bare `index(:tickets, [:type])` and `index(:sprints, [:status])` rarely help tenant-scoped queries.
-
----
-
-## P2 — `list_changelog` domain limit uncapped
-
-**Where:** `Collaboration.list_changelog/4`  
-`limit = Keyword.get(opts, :limit, 50)` — **no `min(…, max)`**
-
-MCP caps schema max 100; direct domain callers can pass arbitrary limit → large scans + memory.
-
-Compare: `list_comments` uses `min(200)`.
-
----
-
-## P2 — `list_comments` MCP has no limit parameter
-
-**Where:** `MCP.Tools.ListComments`  
-Always uses domain default (100, max 200). High-chatter entities always transfer up to 100 full comment bodies with no pagination/`offset`/cursor.
-
----
-
-## P2 — Auth `touch_last_used` on every successful verify
-
-**Where:** `Auth.verify_api_key/2` → `touch_last_used/1`  
-**Plug:** `ElxMcpWeb.Plugs.McpAuth` (every MCP request)
-
-Mitigations present: **60s debounce**, `update_all` by id (cheap). Remaining issues:
-
-1. **Synchronous write** on the request path when debounce fires → extra latency + write load under multi-key traffic.  
-2. **Read-then-maybe-write race**: concurrent requests with stale `last_used_at` can all pass the debounce check → multiple writes per window.  
-3. Debounce is process-local knowledge only from the loaded row; no conditional `WHERE last_used_at IS NULL OR last_used_at < ^cutoff` in SQL (single atomic gate).
-
-`fetch_active_key` always `preload: [:project]` — acceptable for auth scope; not the main cost.
+14. **Search merge bias**  
+    - `projects.ex:283` — `(epics ++ stories ++ tickets) |> Enum.take(limit)` prefers epics then stories; tickets starved when earlier types fill the cap.
 
 ---
 
-## P2 — `list_api_keys/1` unbounded
+## Clean areas
 
-**Where:** `Auth.list_api_keys/1`  
-`Repo.all` for project with no limit. Low volume today; still an unbounded admin/list path.
-
----
-
-## P3 — Parent-cycle walk is O(depth) queries
-
-**Where:** `Projects.walk_creates_cycle?/4`  
-One `Repo.get_by(Ticket, …)` per ancestor hop on ticket create. Fine for shallow trees; deep parent chains amplify write latency. Prefer recursive CTE / single ancestry query if depth grows.
-
----
-
-## P3 — Search / list response encoding cost
-
-MCP list tools `Enum.map(&Helpers.encode_struct/1)` on full schemas (including `metadata` maps, long descriptions). No field allowlist for list vs detail views → larger JSON and encode CPU than list UIs need.
+- No `Repo.*` inside `Enum.map`/`for` over query results on read paths (encode-only maps).  
+- `list_epics` / `list_user_stories` / `list_tickets` default limit 50, hard max 200 via `maybe_limit/2` (`projects.ex:421-425`).  
+- `get_epic_id` / `get_user_story_id` used by list-filter tools (no preload for epic_key / story_key filters).  
+- `status_summary` recent paths use thin `select` maps (not full structs).  
+- Search domain hard-caps limit at 50; MCP schema max 50.  
+- Indexes: `(project_id, updated_at)`, `(project_id, assignee_email)`, `(project_id, status)` on core work tables.  
+- `list_api_keys/2` limited (`auth.ex:98-107`).  
+- Rate limit uses atomic ETS `update_counter` with `read_concurrency` / `write_concurrency` (not a GenServer bottleneck).  
+- `increment_time_spent` is a single `update_all` (`projects.ex:214-221`).  
+- `next_issue_key` uses `FOR UPDATE` in a transaction (correct, write-path only).  
+- No heavy LiveView collections (MCP-first app).  
+- Tool telemetry duration emission available (`helpers.ex:67-97`) for future latency SLOs.
 
 ---
 
-## Issue inventory (quick)
+## Issue inventory
 
-| # | Sev | Area | Summary |
-|---|-----|------|---------|
-| 1 | P1 | status_summary | 7 queries; 3×N full-row over-fetch for recent |
-| 2 | P1 | list_epics/stories/tickets | No default/max limit in domain |
-| 3 | P1 | search_work_items | Leading `%` ILIKE ×3; text OR; no FTS/trgm |
-| 4 | P1 | get_epic/story/ticket | Unbounded has_many preloads |
-| 5 | P1 | MCP list tools resolve | get_* + preload only to resolve id |
-| 6 | P2 | migrations | Missing (project_id, updated_at), assignee, composite polymorphic indexes |
-| 7 | P2 | list_changelog | Domain limit uncapped |
-| 8 | P2 | list_comments MCP | No limit/pagination control |
-| 9 | P2 | auth touch_last_used | Sync write; non-atomic debounce |
-| 10 | P2 | list_api_keys | Unbounded |
-| 11 | P3 | parent cycle walk | N queries per depth |
-| 12 | P3 | encode_struct lists | Full schema in list payloads |
+| # | Sev | Location | Summary |
+|---|-----|----------|---------|
+| 1 | P1 | `projects.ex:246-283` | Leading-% ILIKE ×3; no FTS/trgm |
+| 2 | P1 | `projects.ex:105,159,242` | Unbounded has_many preloads on get_* |
+| 3 | P1 | `list_comments.ex:39-58`, `list_changelog.ex:40-59` | Full get_* to resolve id |
+| 4 | P2 | `projects.ex:289-354` | status_summary 7 sequential queries |
+| 5 | P2 | all `list_*` | No offset/cursor pagination |
+| 6 | P2 | MCP list tools | Full-schema encode |
+| 7 | P2 | `collaboration.ex:74` | list_changelog limit uncapped |
+| 8 | P2 | `list_comments.ex` | No MCP limit param |
+| 9 | P2 | `auth.ex:119-131` | Sync touch_last_used |
+| 10 | P2 | migrations | Collab composites; tenant type/status; search indexes |
+| 11 | P2 | `rate_limit.ex` | No ETS bucket GC; single-node |
+| 12 | P3 | `projects.ex:375-394` | Cycle walk N queries |
+| 13 | P3 | `projects.ex:356-363` | Full-row existence check |
+| 14 | P3 | `projects.ex:283` | Search type-order bias |
 
 ---
 
 ## Suggested fix priority (not implemented)
 
-1. Cap domain `list_*` / search limits; thin `select` for list/search.  
-2. Collapse `status_summary` (counts + recent) into fewer queries; select only summary columns.  
-3. Add `(project_id, updated_at DESC)` (+ assignee composites as needed).  
-4. ID-only key lookups for list filters / comment-changelog resolve.  
-5. Limit or paginate get_* association preloads (or separate “detail with children” API).  
-6. Search: key exact/prefix path; consider `pg_trgm` GIN on title (and maybe description later); cap domain limit.  
-7. Auth: SQL-gated debounce or async/sampled last_used updates.
+1. Search: key exact/prefix path; FTS or `pg_trgm` GIN on title; optional description; keep hard cap.  
+2. Cap or paginate `get_*` association preloads (or split “detail vs children list”).  
+3. Wire comments/changelog to `get_*_id` (+ add `get_ticket_id`).  
+4. Collapse or parallelize `status_summary` round-trips.  
+5. List projection selects; optional offset/cursor.  
+6. Cap `list_changelog`; expose limit on `list_comments`.  
+7. Collaboration composite indexes; SQL-gated or async `last_used_at`; periodic ETS bucket prune.
 
 ---
 
-*End of issues-only performance audit.*
+*End of performance audit. No application code changed.*

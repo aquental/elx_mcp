@@ -4,6 +4,14 @@ Servidor **MCP (Model Context Protocol)** em **Phoenix/Elixir** que expõe o **s
 
 Os dados ficam no **PostgreSQL** (host configurável via `.env`). Cada cliente autentica-se com **`X-API-Key` + `X-Email`**: a chave deve estar associada ao e-mail informado e a **um projeto**. O MCP é **somente leitura** no MVP.
 
+### Known limitations (security)
+
+- **Rate limit** is single-node ETS (IP pre-auth). For multi-node, put Redis/Hammer (or a reverse-proxy limiter) in front.
+- **MCP session lifecycle** (`mcp-session-id`): first authenticated **POST** with the session header binds it to `{api_key_id, project_id}` (30m TTL). **DELETE/GET** require a live bind (fail-closed if unbound/expired/foreign → 403). Tool tenant isolation still re-auths every request.
+- **Write APIs** in contexts require `project:write` on `%Scope{}`; MCP tools remain read-only until write tools ship.
+- **`pg_trgm`**: title search GIN indexes need `CREATE EXTENSION pg_trgm` (superuser on some hosts). Without it, ILIKE title search still works.
+
+
 ## O que este projeto faz
 
 - **Multi-tenant**: vários projetos no mesmo banco; isolamento por `project_id` da API Key

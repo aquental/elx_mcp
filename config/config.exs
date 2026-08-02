@@ -12,7 +12,8 @@ config :elx_mcp,
   generators: [timestamp_type: :utc_datetime_usec, binary_id: true],
   # Comma-separated origins; "*" only when :allow_cors_star is true (dev)
   mcp_cors_origins: [],
-  allow_cors_star: false
+  allow_cors_star: false,
+  mcp_rate_limit: [limit: 120, window_ms: 60_000]
 
 # Configure the endpoint
 config :elx_mcp, ElxMcpWeb.Endpoint,

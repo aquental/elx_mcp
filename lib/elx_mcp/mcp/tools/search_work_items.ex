@@ -19,7 +19,7 @@ defmodule ElxMcp.MCP.Tools.SearchWorkItems do
       start = System.monotonic_time(:millisecond)
       limit = Map.get(params, :limit) || 25
       data = Projects.search_work_items(scope, q, limit: limit)
-      Helpers.emit_tool("search_work_items", scope.project_id, start, :ok)
+      Helpers.emit_tool("search_work_items", scope, start, :ok, params)
       Helpers.json_reply(frame, %{results: data})
     end)
   end

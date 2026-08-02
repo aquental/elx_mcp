@@ -11,27 +11,24 @@ alias ElxMcp.{Auth, Collaboration, Projects, Tenancy}
       {:ok, existing}
   end
 
-{:ok, board} =
-  case Projects.list_boards(%ElxMcp.Auth.Scope{
-         project_id: project.id,
-         actor_email: "seed@example.com",
-         api_key_id: Ecto.UUID.generate(),
-         scopes: ["project:read"]
-       }) do
-    [] -> Projects.create_board(project.id, %{name: "Main Board", type: "scrum"})
-    [b | _] -> {:ok, b}
-  end
-
-scope = %ElxMcp.Auth.Scope{
+write_scope = %ElxMcp.Auth.Scope{
   project_id: project.id,
   actor_email: "seed@example.com",
   api_key_id: Ecto.UUID.generate(),
-  scopes: ["project:read"]
+  scopes: ["project:read", "project:write"]
 }
+
+scope = %{write_scope | scopes: ["project:read"]}
+
+{:ok, board} =
+  case Projects.list_boards(scope) do
+    [] -> Projects.create_board(write_scope, %{name: "Main Board", type: "scrum"})
+    [b | _] -> {:ok, b}
+  end
 
 {:ok, sprint} =
   if Projects.list_sprints(scope) == [] do
-    Projects.create_sprint(project.id, %{
+    Projects.create_sprint(write_scope, %{
       name: "Sprint 1",
       status: "active",
       board_id: board.id,
@@ -43,7 +40,7 @@ scope = %ElxMcp.Auth.Scope{
 
 {:ok, epic} =
   if Projects.list_epics(scope) == [] do
-    Projects.create_epic(project.id, %{
+    Projects.create_epic(write_scope, %{
       title: "MCP Project Status",
       description: "Expose project status via MCP",
       status: "in_progress",
@@ -63,7 +60,7 @@ stories = Projects.list_user_stories(scope)
 
     _ ->
       {:ok, s1} =
-        Projects.create_user_story(project.id, %{
+        Projects.create_user_story(write_scope, %{
           title: "As an agent I can read project status",
           epic_id: epic.id,
           status: "in_progress",
@@ -74,7 +71,7 @@ stories = Projects.list_user_stories(scope)
         })
 
       {:ok, s2} =
-        Projects.create_user_story(project.id, %{
+        Projects.create_user_story(write_scope, %{
           title: "As a user I can manage API keys via mix task",
           status: "to_do",
           story_points: 3,
@@ -86,7 +83,7 @@ stories = Projects.list_user_stories(scope)
 
 if Projects.list_tickets(scope) == [] do
   {:ok, t1} =
-    Projects.create_ticket(project.id, %{
+    Projects.create_ticket(write_scope, %{
       title: "Implement schemas",
       user_story_id: story1.id,
       type: "task",
@@ -95,7 +92,7 @@ if Projects.list_tickets(scope) == [] do
     })
 
   {:ok, _t2} =
-    Projects.create_ticket(project.id, %{
+    Projects.create_ticket(write_scope, %{
       title: "Implement MCP tools",
       user_story_id: story1.id,
       type: "task",
@@ -104,7 +101,7 @@ if Projects.list_tickets(scope) == [] do
     })
 
   {:ok, _t3} =
-    Projects.create_ticket(project.id, %{
+    Projects.create_ticket(write_scope, %{
       title: "Add isolation tests",
       user_story_id: story1.id,
       type: "task",
@@ -112,7 +109,7 @@ if Projects.list_tickets(scope) == [] do
     })
 
   {:ok, _t4} =
-    Projects.create_ticket(project.id, %{
+    Projects.create_ticket(write_scope, %{
       title: "Document mix task",
       user_story_id: story2.id,
       type: "chore",
@@ -120,7 +117,7 @@ if Projects.list_tickets(scope) == [] do
     })
 
   {:ok, _} =
-    Collaboration.create_comment(project.id, %{
+    Collaboration.create_comment(write_scope, %{
       commentable_type: "ticket",
       commentable_id: t1.id,
       author_email: "dev@example.com",
@@ -128,7 +125,7 @@ if Projects.list_tickets(scope) == [] do
     })
 
   {:ok, _} =
-    Collaboration.record_changelog(project.id, %{
+    Collaboration.record_changelog(write_scope, %{
       entity_type: "ticket",
       entity_id: t1.id,
       actor_email: "dev@example.com",

@@ -20,8 +20,12 @@ config :swoosh, :api_client, false
 # Print only warnings and errors during test
 config :logger, level: :warning
 
-# Relax MCP rate limit noise in tests; still exercised unit-wise when needed
-config :elx_mcp, allow_cors_star: true, mcp_cors_origins: ["*"]
+# Relax MCP rate limit noise in tests; 429 plug tests override via Application.put_env
+config :elx_mcp,
+  allow_cors_star: true,
+  mcp_cors_origins: ["*"],
+  log_mcp_tools: false,
+  mcp_rate_limit: [limit: 10_000, window_ms: 60_000]
 
 # Initialize plugs at runtime for faster test compilation
 config :phoenix, :plug_init_mode, :runtime

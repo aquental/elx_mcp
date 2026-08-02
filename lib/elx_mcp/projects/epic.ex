@@ -29,7 +29,6 @@ defmodule ElxMcp.Projects.Epic do
   def changeset(epic, attrs) do
     epic
     |> cast(attrs, [
-      :key,
       :title,
       :description,
       :status,
@@ -37,10 +36,10 @@ defmodule ElxMcp.Projects.Epic do
       :owner_email,
       :starts_on,
       :due_on,
-      :metadata,
-      :project_id
+      :metadata
     ])
-    |> validate_required([:key, :title, :project_id])
+    # :key and :project_id set via put_change in context (not mass-assigned)
+    |> validate_required([:title])
     |> validate_inclusion(:status, Catalog.statuses())
     |> validate_inclusion(:priority, Catalog.priorities())
     |> unique_constraint(:key)

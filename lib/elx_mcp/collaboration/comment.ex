@@ -23,19 +23,17 @@ defmodule ElxMcp.Collaboration.Comment do
   def changeset(comment, attrs) do
     comment
     |> cast(attrs, [
-      :project_id,
       :commentable_type,
       :commentable_id,
-      :author_email,
       :body
     ])
+    # :project_id and :author_email set via put_change from Scope
     |> validate_required([
-      :project_id,
       :commentable_type,
       :commentable_id,
-      :author_email,
       :body
     ])
     |> validate_inclusion(:commentable_type, Catalog.linkable_types())
+    |> foreign_key_constraint(:project_id)
   end
 end

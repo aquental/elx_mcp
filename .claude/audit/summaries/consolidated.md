@@ -1,85 +1,147 @@
-# Consolidated Summary
+# Consolidated Audit Summary — ElxMCP
+**Date:** 2026-08-02  
+**Overall:** 76 (C)  
+**Strategy:** Compress  
+**Input:** 5 files, ~12k tokens  
+**Output:** ~2.5k tokens  
 
-**Strategy**: Compress  
-**Input**: 5 files, ~9k tokens  
-**Output**: ~2.5k tokens (~72% reduction)  
-**Date**: 2026-08-01  
+**Formula:** `arch×0.20 + perf×0.25 + sec×0.25 + test×0.15 + deps×0.15`  
+= `74×0.20 + 72×0.25 + 80×0.25 + 72×0.15 + 85×0.15`  
+= `14.8 + 18.0 + 20.0 + 10.8 + 12.75` = **76.35 → 76**
 
-## Health scores
+**Comparison (previous re-audit):** 78 (arch 74, perf 74, sec 83, test 72, deps 86)  
+**Delta:** −2 overall (perf −2, sec −3, deps −1; arch/test flat). Residual class unchanged; stricter scoring on rate-limit/session/search/preload and CVE-audit hygiene.
 
-| Category | Score | Weight | Weighted |
-|----------|------:|-------:|---------:|
-| Architecture | 67 | 20% | 13.4 |
-| Performance | 58 | 25% | 14.5 |
-| Security | 72 | 25% | 18.0 |
-| Tests | 60 | 15% | 9.0 |
-| Dependencies | 72 | 15% | 10.8 |
-| **Overall** | **66** | 100% | **65.7** |
+---
 
-**Overall: 66 / 100** — solid skeleton and auth core; performance and test gaps dominate risk under growth.
+## Category scores
 
-## Critical findings (deduped)
+| Category | Score | Grade | Weight | Weighted | Δ vs prior |
+|----------|------:|-------|-------:|---------:|-----------:|
+| Architecture | **74** | C | 0.20 | 14.8 | 0 |
+| Performance | **72** | C | 0.25 | 18.0 | −2 |
+| Security | **80** | B | 0.25 | 20.0 | −3 |
+| Tests | **72** | C | 0.15 | 10.8 | 0 |
+| Dependencies | **85** | B | 0.15 | 12.75 | −1 |
+| **Overall** | **76** | **C** | 1.00 | **76.35** | **−2** |
 
-> Security reported **no app-code criticals**. Below = highest-severity / cross-cutting items only (P0–P1 / Critical / HIGH).
+---
 
-### Security / infra
+## Critical / P1 (deduped)
 
-1. **DB TLS defaults to `verify_none`** — `config/runtime.exs` (`DB_SSL`). Prod MITM risk on tenant data + `key_hash`. *Source: security-audit*
-2. **MCP sessions unbound to `api_key_id` / weak session entropy** — session DELETE/SSE keyed only by low-entropy Anubis id. *Source: security-audit*
-3. **Rate limiter weak** — IP-only, non-atomic ETS RMW, non-distributed, unbounded keys. *Sources: security-audit, test-audit (flake), perf-audit (touch path)*
+### Security / Auth runtime
 
-### Architecture / security latent authz
+1. **Rate-limit ETS not Application-owned → table dies with first creator process**  
+   - **Sources:** security-audit (P1 #1), perf-audit (P2 #11), test-audit (async ETS flake)  
+   - `auth/rate_limit.ex` + `mcp_auth.ex`: named public ETS created by request process; exit deletes table; counters don’t accumulate across connections → abuse protection largely ineffective. Also: no bucket GC, single-node, IP-only key.  
+   - **Fix:** Create/own table in Application (or GenServer + heir); prune buckets; post-auth key by `api_key_id`; multi-node → Redis/Hammer.
 
-4. **Cross-context cycle + Repo reach-in** — `Projects.Ticket` ↔ `Collaboration.Worklog`; Collaboration updates Ticket `time_spent_seconds` via direct Repo. *Source: arch-review*
-5. **Scope dual API + `project:write` unused** — reads use `%Scope{}`, writes bare `project_id`; verify requires only `project:read`. *Sources: arch-review, security-audit*
-6. **FK / `project_id` cast on schemas** — mass-assignment IDOR when write tools land. *Sources: arch-review, security-audit*
+2. **MCP sessions not bound to `api_key_id` / project**  
+   - **Source:** security-audit (P1 #2)  
+   - Session lifecycle (SSE/DELETE) keyed only by client `mcp-session-id`; ~48-bit practical entropy; any authed principal who knows session id can disrupt another client. Tool data remains tenant-correct via re-auth + assigns merge.  
+   - **Fix:** Bind session → `{api_key_id, project_id}`; reject lifecycle ops on mismatch; higher-entropy ids.
 
-### Performance (P1)
+### Architecture / authz dual-API (latent write path)
 
-7. **`status_summary/2` 7-query fan-out + 3×N full-row recent** — `projects.ex`; MCP status tool/resource. *Source: perf-audit*
-8. **Unbounded domain lists** when `limit` omitted (`list_epics/stories/tickets`). *Source: perf-audit*
-9. **`search_work_items` leading-`%` ILIKE ×3 tables** — no FTS/trgm; up to 3× limit before merge. *Source: perf-audit*
-10. **Unbounded `get_*` has_many preloads** + **list tools resolve keys via full `get_*`**. *Source: perf-audit* (ties to arch incomplete boundaries)
+3. **Writes take bare `project_id`; `project:write` catalogued but never enforced**  
+   - **Sources:** arch-review (P1 ×3), security-audit (P2 #4/#6)  
+   - Projects + Collaboration mutations use bare `project_id`; `verify_api_key` only requires `project:read`; authn fused with min authz. No MCP write tools yet, but future tools inherit IDOR/mass-assignment risk.  
+   - **Fix:** `create_*(%Scope{}, attrs)`; enforce `Scope.has_scope?(scope, "project:write")` at mutation boundary; separate authn from scope checks.
 
-### Tests (false confidence)
+### Performance (read path)
 
-11. **Cycle-detection test does not fail** — `projects_test.exs` ~L107–127 asserts `{:ok,_}` only; never `{:error, :cycle_detected}`. *Source: test-audit*
-12. **5/12 MCP tools + 0/5 resources untested**; rate-limit 429 untested. *Source: test-audit*
+4. **Leading-`%` ILIKE search × 3 tables (no FTS/trgm)**  
+   - **Source:** perf-audit (P1 #1); security notes parameterized ILIKE only (no SQLi)  
+   - `projects.ex` `search_work_items/3` — B-tree unusable; three sequential scans; no ranking.  
+   - **Fix:** exact/prefix key path; `pg_trgm` GIN or FTS; keep hard cap.
 
-### Dependencies (HIGH)
+5. **Unbounded `has_many` preloads on `get_*` + full-graph MCP encode**  
+   - **Source:** perf-audit (P1 #2)  
+   - `get_epic` / `get_user_story` / `get_ticket` preload children without cap; tools/resources encode full structs.  
+   - **Fix:** Cap/paginate children or split detail vs list APIs.
 
-13. **`anubis_mcp` LGPL-3.0** — Combined Work on BEAM; no LICENSE/NOTICE/redistribution docs. *Source: deps-audit*
-14. **Elixir pin `~> 1.17` vs Anubis `~> 1.18`**. *Source: deps-audit*
+6. **list_comments / list_changelog resolve entity via full `get_*`**  
+   - **Source:** perf-audit (P1 #3)  
+   - Wastes association loads for id-only resolution.  
+   - **Fix:** Use `get_*_id` (+ add `get_ticket_id`).
+
+### Tests
+
+7. **MCP resources mostly untested; tools smoke-only; Plug 429 missing**  
+   - **Source:** test-audit (P1 ×3)  
+   - 4/5 resources untested; tools assert `isError` only; 429 path not integration-tested (ties to broken rate-limit).  
+   - **Fix:** Resource happy/not_found/unauth; decode JSON shape; MCPAuth 429 after ETS ownership fix.
+
+**Deps:** no P1.
+
+---
 
 ## Cross-category correlations
 
-| Theme | Categories | Link |
-|-------|------------|------|
-| **Write path not production-ready** | Arch + Sec + Tests | Incomplete mutations, FK cast, no `project:write` gate; tests don’t cover write hazards; security marks as latent IDOR |
-| **Auth path cost & correctness** | Perf + Sec + Tests | Sync `touch_last_used` + non-atomic debounce (perf); rate limit non-atomic/IP-only (sec); neither 429 nor last_used tested |
-| **Over-fetch = blast radius** | Perf + Arch + Sec | Full preloads on get/list resolve increase data exposure surface if session/tool bugs; soft context boundaries (worklogs on ticket) |
-| **Scope / tenant boundary** | Arch + Sec + Perf | Dual Scope vs `project_id` weakens authz; list/search without hard caps amplify cross-tenant mistakes if filters ever drop |
-| **MCP surface maturity** | Arch + Tests + Deps | Read-only tools thin; incomplete coverage; LGPL Anubis is core of all MCP transport |
-| **Operational readiness** | Sec + Deps | TLS defaults + missing `mix_audit` in precommit leave prod/compliance gaps |
+| Root cause | Agents | Impact |
+|------------|--------|--------|
+| **Dual Scope API + cast `:project_id` + unused `project:write`** | arch, security | Latent tenant IDOR on any future write tool; Ticket already correct (`put_change` only) |
+| **Rate-limit ETS ownership / GC / single-node** | security (P1), perf (P2), test (flake/429 gap) | Ineffective prod limiting + flaky concurrent tests |
+| **Unbounded get preloads + full encode** | perf (P1), test (weak get asserts) | Memory/JSON cost; weak regression signal |
+| **Search ILIKE without FTS** | perf (P1), security (P3 escape only) | Tenant-scoped perf risk, not SQLi |
+| **Missing CVE/static tooling** | deps (`mix_audit`), security (`sobelow` absent) | No automated advisory/static security gate in CI |
+| **MCP session vs tenant binding** | security only | Orthogonal to tool tenant isolation (which is sound) |
 
-## Top 5 recommendations
+---
 
-1. **Prod DB TLS verify-peer** — require CA (`DB_SSL` + `DB_CA_CERT`); never default `verify_none` in prod. *(Security P0)*
-2. **Cap & thin domain queries** — default/max `limit` on list/search; collapse `status_summary`; ID-only key resolve; limit preloads; add `(project_id, updated_at DESC)` (+ assignee/polymorphic composites). *(Performance P1)*
-3. **Harden auth transport** — bind MCP sessions to key/tenant; atomic multi-node rate limit (+ proxy trust); optional key `expires_at`. *(Security P1)*
-4. **Close context boundaries before writes** — break Ticket↔Worklog cycle; Scope-first mutations; stop casting tenant FKs; enforce `project:write` on every mutation. *(Architecture + Security latent)*
-5. **Fix false tests + LGPL/compliance** — real cycle-detection assertion; cover remaining tools/resources + 429; document Anubis LGPL NOTICE + raise Elixir to `~> 1.18`; add `mix_audit` to precommit. *(Tests + Dependencies)*
+## P2 residual (compressed)
+
+| Area | Items |
+|------|--------|
+| **Arch** | Projects multi-aggregate hub (~433 LOC / 21 public); dead Component/ComponentLink surface; polymorphic collab writes without entity ownership; FKs still in cast lists (non-Ticket) |
+| **Perf** | `status_summary` 7 sequential RTTs; list APIs limit-only (no cursor); full-schema list encode; `list_changelog` domain limit uncapped; `list_comments` no MCP limit; sync `touch_last_used`; missing collab composite indexes |
+| **Sec** | API keys never expire; prod `DB_SSL=false` opt-out; no auth audit trail |
+| **Test** | No ListTickets happy path; Projects filter/component gaps; CORS untested; no factories; shared ETS + async MCPAuth |
+| **Deps** | No `mix_audit`/deps.audit; LGPL Combined Work packaging incomplete for binary ship; unused `swoosh`/`req`; loose `postgrex ">= 0.0.0"` |
+
+P3 omitted (naming Projects vs Tenancy.Project, framework xref cycle, validation_matrix mega-test, etc.).
+
+---
+
+## Action plan
+
+### Immediate (this sprint)
+
+1. **Own rate-limit ETS in Application** (+ basic bucket prune); prove counters across two TCP connections.  
+2. **Bind MCP sessions to `api_key_id`/`project_id`** (or document Anubis limitation + risk acceptance).  
+3. **Wire comments/changelog to `get_*_id`** (+ `get_ticket_id`); stop full get for id resolve.  
+4. **Add `mix_audit` + `mix sobelow`** to dev deps / precommit (or explicit risk accept).  
+5. **Integration test MCPAuth 429** after ETS fix; cover remaining 4 MCP resources smoke + not_found.
+
+### Short-term (next 1–2 sprints)
+
+6. **Scope-first mutations** on Projects/Collaboration; drop `:project_id`/`:key` from cast; enforce `project:write` when any write tool lands.  
+7. **Search path:** key exact/prefix + trgm/FTS; keep cap; optional ranking.  
+8. **Cap/paginate get_* children**; list projections (`key/title/status/…`) instead of full encode.  
+9. **API key `expires_at`** + rotation runbook; SQL-gate or async `last_used_at`.  
+10. **Test depth:** ListTickets happy path; JSON shape asserts; CORS plug; factories for DataCase.  
+11. Cap `list_changelog`; expose limit on `list_comments`; tighten `postgrex` pin.
+
+### Long-term
+
+12. Split Projects multi-aggregate before write surface grows.  
+13. Cursor pagination + collab composite indexes; parallelize/CTE `status_summary`.  
+14. Multi-node rate limit (Redis/Hammer) + trusted-proxy IP.  
+15. Remove unused swoosh/req or productize email; complete LGPL Combined Work pack if shipping binaries.  
+16. Full `/mcp` E2E; auth audit events; optional domain changelog on mutations.
+
+---
 
 ## Coverage
 
 | File | Represented | Key items |
-|------|:-----------:|----------:|
-| arch-review.md | Yes | 6 (cycle, Repo, scope, write scope, FK cast, incomplete surface) |
-| perf-audit.md | Yes | 5 P1 + index gaps |
-| security-audit.md | Yes | DB TLS, sessions, rate limit, key expiry, FK cast |
-| test-audit.md | Yes | Cycle false test, tool/resource gaps, 429, ETS flake |
-| deps-audit.md | Yes | LGPL, Elixir pin, mix_audit, unused swoosh/req |
+|------|-------------|-----------|
+| arch-review.md | Yes | Score 74; dual Scope; project:write; god-context; Component dead |
+| perf-audit.md | Yes | Score 72; ILIKE search; unbounded preloads; get_* for lists |
+| security-audit.md | Yes | Score 80; ETS ownership; session binding; cast/expiry |
+| test-audit.md | Yes | Score 72; resources/tools/429 gaps |
+| deps-audit.md | Yes | Score 85; no mix_audit; LGPL; unused deps |
 
-## Coverage Gaps
+## Coverage gaps
 
 None.

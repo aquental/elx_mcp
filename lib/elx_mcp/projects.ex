@@ -1,20 +1,37 @@
 defmodule ElxMcp.Projects do
   @moduledoc """
   Project work items: epics, stories, tickets, boards, sprints, components.
-  All reads/writes for a tenant must pass `%ElxMcp.Auth.Scope{}` or `project_id`.
+
+  **Writes** take `%ElxMcp.Auth.Scope{}` and require `project:write`.
+  **Reads** take `%Scope{}` with tenant isolation via pinned `project_id`.
+
+  `get_*` preloads at most 50 child associations by default (`:child_limit`, max 200).
+  Full child enumeration uses `list_*` with filters.
   """
 
   import Ecto.Query
+  alias ElxMcp.Auth
   alias ElxMcp.Auth.Scope
   alias ElxMcp.Projects.{Board, Component, Epic, Sprint, Ticket, UserStory}
   alias ElxMcp.Repo
   alias ElxMcp.Tenancy
 
+  @default_child_limit 50
+  @max_child_limit 200
+
   # --- Boards / Sprints / Components ---
 
-  def create_board(project_id, attrs) do
+  def create_board(%Scope{} = scope, attrs) do
+    with :ok <- Auth.authorize_write(scope) do
+      do_create_board(scope.project_id, attrs)
+    end
+  end
+
+  defp do_create_board(project_id, attrs) do
     %Board{}
-    |> Board.changeset(Map.put(attrs, :project_id, project_id))
+    |> Board.changeset(attrs)
+    |> Ecto.Changeset.put_change(:project_id, project_id)
+    |> Ecto.Changeset.validate_required([:project_id])
     |> Repo.insert()
   end
 
@@ -29,12 +46,25 @@ defmodule ElxMcp.Projects do
     )
   end
 
-  def create_sprint(project_id, attrs) do
+  def create_sprint(%Scope{} = scope, attrs) do
+    with :ok <- Auth.authorize_write(scope) do
+      do_create_sprint(scope.project_id, attrs)
+    end
+  end
+
+  defp do_create_sprint(project_id, attrs) do
     attrs = Map.new(attrs)
 
-    with :ok <- ensure_same_project(Board, Map.get(attrs, :board_id), project_id) do
+    with :ok <-
+           ensure_same_project(
+             Board,
+             Map.get(attrs, :board_id) || Map.get(attrs, "board_id"),
+             project_id
+           ) do
       %Sprint{}
-      |> Sprint.changeset(Map.put(attrs, :project_id, project_id))
+      |> Sprint.changeset(attrs)
+      |> Ecto.Changeset.put_change(:project_id, project_id)
+      |> Ecto.Changeset.validate_required([:project_id])
       |> Repo.insert()
     end
   end
@@ -64,24 +94,35 @@ defmodule ElxMcp.Projects do
     end
   end
 
-  def create_component(project_id, attrs) do
+  def create_component(%Scope{} = scope, attrs) do
+    with :ok <- Auth.authorize_write(scope) do
+      do_create_component(scope.project_id, attrs)
+    end
+  end
+
+  defp do_create_component(project_id, attrs) do
     %Component{}
-    |> Component.changeset(Map.put(attrs, :project_id, project_id))
+    |> Component.changeset(attrs)
+    |> Ecto.Changeset.put_change(:project_id, project_id)
+    |> Ecto.Changeset.validate_required([:project_id])
     |> Repo.insert()
   end
 
   # --- Epics ---
 
-  def create_epic(project_id, attrs) do
-    with {:ok, key} <- Tenancy.next_issue_key(project_id) do
-      attrs =
-        attrs
-        |> Map.new()
-        |> Map.put(:project_id, project_id)
-        |> Map.put(:key, key)
+  def create_epic(%Scope{} = scope, attrs) do
+    with :ok <- Auth.authorize_write(scope) do
+      do_create_epic(scope.project_id, attrs)
+    end
+  end
 
+  defp do_create_epic(project_id, attrs) do
+    with {:ok, key} <- Tenancy.next_issue_key(project_id) do
       %Epic{}
       |> Epic.changeset(attrs)
+      |> Ecto.Changeset.put_change(:project_id, project_id)
+      |> Ecto.Changeset.put_change(:key, key)
+      |> Ecto.Changeset.validate_required([:project_id, :key])
       |> Repo.insert()
     end
   end
@@ -96,13 +137,23 @@ defmodule ElxMcp.Projects do
     |> Repo.all()
   end
 
-  def get_epic(%Scope{project_id: project_id}, key) when is_binary(key) do
+  def get_epic(%Scope{project_id: project_id}, key, opts \\ []) when is_binary(key) do
     case Repo.one(from e in Epic, where: e.project_id == ^project_id and e.key == ^key) do
       nil ->
         {:error, :not_found}
 
       epic ->
-        {:ok, Repo.preload(epic, [:user_stories], in_parallel: false)}
+        n = child_limit(opts)
+
+        stories =
+          from(us in UserStory,
+            where: us.epic_id == ^epic.id and us.project_id == ^project_id,
+            order_by: [desc: us.updated_at],
+            limit: ^n
+          )
+          |> Repo.all()
+
+        {:ok, %{epic | user_stories: stories}}
     end
   end
 
@@ -120,20 +171,24 @@ defmodule ElxMcp.Projects do
 
   # --- User stories ---
 
-  def create_user_story(project_id, attrs) do
+  def create_user_story(%Scope{} = scope, attrs) do
+    with :ok <- Auth.authorize_write(scope) do
+      do_create_user_story(scope.project_id, attrs)
+    end
+  end
+
+  defp do_create_user_story(project_id, attrs) do
     attrs = Map.new(attrs)
 
     with {:ok, key} <- Tenancy.next_issue_key(project_id),
-         :ok <- ensure_same_project(Epic, Map.get(attrs, :epic_id), project_id),
-         :ok <- ensure_same_project(Board, Map.get(attrs, :board_id), project_id),
-         :ok <- ensure_same_project(Sprint, Map.get(attrs, :sprint_id), project_id) do
-      attrs =
-        attrs
-        |> Map.put(:project_id, project_id)
-        |> Map.put(:key, key)
-
+         :ok <- ensure_same_project(Epic, get_attr(attrs, :epic_id), project_id),
+         :ok <- ensure_same_project(Board, get_attr(attrs, :board_id), project_id),
+         :ok <- ensure_same_project(Sprint, get_attr(attrs, :sprint_id), project_id) do
       %UserStory{}
       |> UserStory.changeset(attrs)
+      |> Ecto.Changeset.put_change(:project_id, project_id)
+      |> Ecto.Changeset.put_change(:key, key)
+      |> Ecto.Changeset.validate_required([:project_id, :key])
       |> Repo.insert()
     end
   end
@@ -150,13 +205,24 @@ defmodule ElxMcp.Projects do
     |> Repo.all()
   end
 
-  def get_user_story(%Scope{project_id: project_id}, key) when is_binary(key) do
+  def get_user_story(%Scope{project_id: project_id}, key, opts \\ []) when is_binary(key) do
     case Repo.one(from s in UserStory, where: s.project_id == ^project_id and s.key == ^key) do
       nil ->
         {:error, :not_found}
 
       story ->
-        {:ok, Repo.preload(story, [:tickets, :epic], in_parallel: false)}
+        n = child_limit(opts)
+        epic = if story.epic_id, do: Repo.get_by(Epic, id: story.epic_id, project_id: project_id)
+
+        tickets =
+          from(t in Ticket,
+            where: t.user_story_id == ^story.id and t.project_id == ^project_id,
+            order_by: [desc: t.updated_at],
+            limit: ^n
+          )
+          |> Repo.all()
+
+        {:ok, %{story | epic: epic, tickets: tickets}}
     end
   end
 
@@ -174,15 +240,21 @@ defmodule ElxMcp.Projects do
 
   # --- Tickets ---
 
-  def create_ticket(project_id, attrs) do
+  def create_ticket(%Scope{} = scope, attrs) do
+    with :ok <- Auth.authorize_write(scope) do
+      do_create_ticket(scope.project_id, attrs)
+    end
+  end
+
+  defp do_create_ticket(project_id, attrs) do
     attrs = Map.new(attrs)
 
     with {:ok, key} <- Tenancy.next_issue_key(project_id),
-         :ok <- ensure_same_project(UserStory, Map.get(attrs, :user_story_id), project_id),
-         :ok <- ensure_same_project(Ticket, Map.get(attrs, :parent_ticket_id), project_id),
-         :ok <- ensure_same_project(Board, Map.get(attrs, :board_id), project_id),
-         :ok <- ensure_same_project(Sprint, Map.get(attrs, :sprint_id), project_id),
-         :ok <- validate_parent_cycle(project_id, Map.get(attrs, :parent_ticket_id), nil) do
+         :ok <- ensure_same_project(UserStory, get_attr(attrs, :user_story_id), project_id),
+         :ok <- ensure_same_project(Ticket, get_attr(attrs, :parent_ticket_id), project_id),
+         :ok <- ensure_same_project(Board, get_attr(attrs, :board_id), project_id),
+         :ok <- ensure_same_project(Sprint, get_attr(attrs, :sprint_id), project_id),
+         :ok <- validate_parent_cycle(project_id, get_attr(attrs, :parent_ticket_id), nil) do
       %Ticket{}
       |> Ticket.changeset(attrs)
       |> Ecto.Changeset.put_change(:project_id, project_id)
@@ -194,8 +266,15 @@ defmodule ElxMcp.Projects do
 
   @doc """
   Updates a ticket's parent. Used for hierarchy changes and cycle detection tests.
+  Requires `project:write`.
   """
-  def update_ticket_parent(project_id, ticket_id, parent_ticket_id) do
+  def update_ticket_parent(%Scope{} = scope, ticket_id, parent_ticket_id) do
+    with :ok <- Auth.authorize_write(scope) do
+      do_update_ticket_parent(scope.project_id, ticket_id, parent_ticket_id)
+    end
+  end
+
+  defp do_update_ticket_parent(project_id, ticket_id, parent_ticket_id) do
     with :ok <- ensure_same_project(Ticket, parent_ticket_id, project_id),
          :ok <- validate_parent_cycle(project_id, parent_ticket_id, ticket_id) do
       case Repo.get_by(Ticket, id: ticket_id, project_id: project_id) do
@@ -233,54 +312,87 @@ defmodule ElxMcp.Projects do
     |> Repo.all()
   end
 
-  def get_ticket(%Scope{project_id: project_id}, key) when is_binary(key) do
+  def get_ticket(%Scope{project_id: project_id}, key, opts \\ []) when is_binary(key) do
     case Repo.one(from t in Ticket, where: t.project_id == ^project_id and t.key == ^key) do
       nil ->
         {:error, :not_found}
 
       ticket ->
-        {:ok, Repo.preload(ticket, [:user_story, :subtasks], in_parallel: false)}
+        n = child_limit(opts)
+
+        story =
+          if ticket.user_story_id,
+            do: Repo.get_by(UserStory, id: ticket.user_story_id, project_id: project_id)
+
+        subtasks =
+          from(t in Ticket,
+            where: t.parent_ticket_id == ^ticket.id and t.project_id == ^project_id,
+            order_by: [desc: t.updated_at],
+            limit: ^n
+          )
+          |> Repo.all()
+
+        {:ok, %{ticket | user_story: story, subtasks: subtasks}}
     end
   end
 
+  @doc "Resolve ticket id by key without preloads."
+  def get_ticket_id(%Scope{project_id: project_id}, key) when is_binary(key) do
+    case Repo.one(
+           from t in Ticket,
+             where: t.project_id == ^project_id and t.key == ^key,
+             select: t.id
+         ) do
+      nil -> {:error, :not_found}
+      id -> {:ok, id}
+    end
+  end
+
+  @doc """
+  Search work items with fast paths:
+
+  1. Exact key (case-insensitive)
+  2. Prefix key (`q%`, no leading `%`)
+  3. Title substring (ILIKE; uses `pg_trgm` GIN when available)
+  4. Description only when `opts[:include_description] == true`
+
+  Hard cap `min(limit, 50)`.
+  """
   def search_work_items(%Scope{project_id: project_id}, q, opts \\ []) when is_binary(q) do
+    q = String.trim(q)
     limit = Keyword.get(opts, :limit, 25) |> min(50)
-    pattern = "%#{escape_like(q)}%"
+    include_desc? = Keyword.get(opts, :include_description, false)
 
-    epics =
-      from(e in Epic,
-        where:
-          e.project_id == ^project_id and
-            (ilike(e.key, ^pattern) or ilike(e.title, ^pattern) or
-               ilike(e.description, ^pattern)),
-        select: %{type: "epic", key: e.key, title: e.title, status: e.status},
-        limit: ^limit
-      )
-      |> Repo.all()
+    if q == "" do
+      []
+    else
+      escaped = escape_like(q)
+      exact_key = String.upcase(q)
+      prefix = escaped <> "%"
+      title_pattern = "%" <> escaped <> "%"
 
-    stories =
-      from(s in UserStory,
-        where:
-          s.project_id == ^project_id and
-            (ilike(s.key, ^pattern) or ilike(s.title, ^pattern) or
-               ilike(s.description, ^pattern)),
-        select: %{type: "user_story", key: s.key, title: s.title, status: s.status},
-        limit: ^limit
-      )
-      |> Repo.all()
+      exact = search_exact_key(project_id, exact_key, limit)
+      remaining = limit - length(exact)
 
-    tickets =
-      from(t in Ticket,
-        where:
-          t.project_id == ^project_id and
-            (ilike(t.key, ^pattern) or ilike(t.title, ^pattern) or
-               ilike(t.description, ^pattern)),
-        select: %{type: "ticket", key: t.key, title: t.title, status: t.status},
-        limit: ^limit
-      )
-      |> Repo.all()
+      prefix_hits =
+        if remaining > 0 do
+          search_prefix_key(project_id, prefix, remaining, MapSet.new(Enum.map(exact, & &1.key)))
+        else
+          []
+        end
 
-    (epics ++ stories ++ tickets) |> Enum.take(limit)
+      remaining = limit - length(exact) - length(prefix_hits)
+      known = MapSet.new(Enum.map(exact ++ prefix_hits, & &1.key))
+
+      title_hits =
+        if remaining > 0 do
+          search_title(project_id, title_pattern, remaining, known, include_desc?)
+        else
+          []
+        end
+
+      exact ++ prefix_hits ++ title_hits
+    end
   end
 
   @doc """
@@ -299,7 +411,116 @@ defmodule ElxMcp.Projects do
     }
   end
 
+  # --- Search helpers ---
+
+  defp search_exact_key(project_id, key, limit) do
+    epics =
+      from(e in Epic,
+        where: e.project_id == ^project_id and e.key == ^key,
+        select: %{type: "epic", key: e.key, title: e.title, status: e.status},
+        limit: ^limit
+      )
+      |> Repo.all()
+
+    stories =
+      from(s in UserStory,
+        where: s.project_id == ^project_id and s.key == ^key,
+        select: %{type: "user_story", key: s.key, title: s.title, status: s.status},
+        limit: ^limit
+      )
+      |> Repo.all()
+
+    tickets =
+      from(t in Ticket,
+        where: t.project_id == ^project_id and t.key == ^key,
+        select: %{type: "ticket", key: t.key, title: t.title, status: t.status},
+        limit: ^limit
+      )
+      |> Repo.all()
+
+    (epics ++ stories ++ tickets) |> Enum.take(limit)
+  end
+
+  defp search_prefix_key(project_id, prefix, limit, exclude_keys) do
+    epics =
+      from(e in Epic,
+        where: e.project_id == ^project_id and ilike(e.key, ^prefix),
+        select: %{type: "epic", key: e.key, title: e.title, status: e.status},
+        limit: ^limit
+      )
+      |> Repo.all()
+
+    stories =
+      from(s in UserStory,
+        where: s.project_id == ^project_id and ilike(s.key, ^prefix),
+        select: %{type: "user_story", key: s.key, title: s.title, status: s.status},
+        limit: ^limit
+      )
+      |> Repo.all()
+
+    tickets =
+      from(t in Ticket,
+        where: t.project_id == ^project_id and ilike(t.key, ^prefix),
+        select: %{type: "ticket", key: t.key, title: t.title, status: t.status},
+        limit: ^limit
+      )
+      |> Repo.all()
+
+    (epics ++ stories ++ tickets)
+    |> Enum.reject(&MapSet.member?(exclude_keys, &1.key))
+    |> Enum.take(limit)
+  end
+
+  defp search_title(project_id, pattern, limit, exclude_keys, include_desc?) do
+    epics =
+      from(e in Epic,
+        where:
+          e.project_id == ^project_id and
+            (ilike(e.title, ^pattern) or
+               (^include_desc? and ilike(e.description, ^pattern))),
+        select: %{type: "epic", key: e.key, title: e.title, status: e.status},
+        limit: ^limit
+      )
+      |> Repo.all()
+
+    stories =
+      from(s in UserStory,
+        where:
+          s.project_id == ^project_id and
+            (ilike(s.title, ^pattern) or
+               (^include_desc? and ilike(s.description, ^pattern))),
+        select: %{type: "user_story", key: s.key, title: s.title, status: s.status},
+        limit: ^limit
+      )
+      |> Repo.all()
+
+    tickets =
+      from(t in Ticket,
+        where:
+          t.project_id == ^project_id and
+            (ilike(t.title, ^pattern) or
+               (^include_desc? and ilike(t.description, ^pattern))),
+        select: %{type: "ticket", key: t.key, title: t.title, status: t.status},
+        limit: ^limit
+      )
+      |> Repo.all()
+
+    (epics ++ stories ++ tickets)
+    |> Enum.reject(&MapSet.member?(exclude_keys, &1.key))
+    |> Enum.take(limit)
+  end
+
   # --- Helpers ---
+
+  defp child_limit(opts) do
+    Keyword.get(opts, :child_limit, @default_child_limit)
+    |> min(@max_child_limit)
+    |> max(1)
+  end
+
+  defp get_attr(attrs, key) when is_atom(key) do
+    Map.get(attrs, key) || Map.get(attrs, Atom.to_string(key))
+  end
 
   defp count_by_status(schema, project_id) do
     from(r in schema,

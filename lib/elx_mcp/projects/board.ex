@@ -21,8 +21,8 @@ defmodule ElxMcp.Projects.Board do
 
   def changeset(board, attrs) do
     board
-    |> cast(attrs, [:name, :type, :metadata, :project_id])
-    |> validate_required([:name, :project_id])
+    |> cast(attrs, [:name, :type, :metadata])
+    |> validate_required([:name])
     |> validate_inclusion(:type, Catalog.board_types())
     |> unique_constraint([:project_id, :name])
     |> foreign_key_constraint(:project_id)

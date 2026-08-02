@@ -21,7 +21,7 @@ defmodule ElxMcp.MCP.Tools.ProjectStatus do
       limit = Map.get(params, :recent_limit) || 10
       data = Projects.status_summary(scope, recent_limit: limit)
       encoded = Helpers.encode_struct(data)
-      Helpers.emit_tool("project_status", scope.project_id, start, :ok)
+      Helpers.emit_tool("project_status", scope, start, :ok, params)
       Helpers.json_reply(frame, encoded)
     end)
   end

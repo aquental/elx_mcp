@@ -1,163 +1,137 @@
-# Security Audit: ElxMCP
+# Security Audit — ElxMCP
+**Date:** 2026-08-02  
+**Score:** 80  
+**Scope:** `lib/elx_mcp/auth*`, `plugs/`, `mcp/`, `config/*`, secrets hygiene  
+**Auth model:** dual-header `X-API-Key` + `X-Email`, SHA-256 of 32-byte keys, multi-tenant `Scope`, MCP via `anubis_mcp`
 
-**Date:** 2026-08-01  
-**Scope:** Auth (`lib/elx_mcp/auth*`), MCP plugs, MCP tools/resources (tenant isolation), `config/runtime.exs` / `dev.exs`, API-key mix tasks  
-**Auth model reviewed:** `X-API-Key` + `X-Email` must match key owner; SHA-256 of 32-byte keys; `project_id` scope via frame assigns  
+## Summary
 
-## Executive Summary
+Core dual-header authentication and read-path tenant isolation remain **sound**. Every MCP tool/resource resolves scope from frame assigns and queries with `project_id == ^…`. No `String.to_atom/1`, no `raw/1`, no SQL interpolation. Secrets load from env in prod; `.env` is gitignored.
 
-ElxMCP’s API-key auth and tenant isolation are **fundamentally sound** for a read-only multi-tenant MCP server: dual headers, high-entropy keys, hash-at-rest, header scrubbing, and consistent `project_id` filters in contexts. Production CORS defaults and `force_ssl` are reasonable.
+Score drops vs a hardened 90+ posture primarily because: **(1)** ETS rate-limit table is owned by the request process that first creates it (not Application), so counters do not reliably survive across connections; **(2)** MCP sessions are not bound to `api_key_id` (DELETE/SSE lifecycle keyed only by client-supplied `mcp-session-id`); **(3)** latent `project_id` mass-assignment on write schemas; **(4)** keys never expire; **(5)** no `mix sobelow` in the project.
 
-Main risks are **infra TLS defaults** (`DB_SSL=verify_none`), **MCP session IDs not bound to the API key** (Anubis entropy + cross-session DELETE), and a **weak/single-node rate limiter**. No critical SQL injection, atom exhaustion, or XSS sinks found in scope.
+`mix sobelow` is **not available** (not in `mix.exs` deps). Manual greps substituted.
 
-## Security Score: **72 / 100**
+## Score breakdown
 
-| Band | Meaning |
-|------|---------|
-| 90–100 | Hardened production posture |
-| 70–89 | Solid core; fix listed issues before scale-out |
-| &lt;70 | Material authz/authn gaps |
+| Bucket | Max | Awarded | Notes |
+|--------|----:|--------:|-------|
+| sobelow / critical manual | 30 | 30 | No critical SQLi / RCE / XSS / atom DoS found |
+| high residual | 20 | 8 | Rate-limit ETS ownership; session not bound to key |
+| authz (tools / events) | 15 | 12 | Reads scoped; write dual-API / cast latent |
+| `to_atom` | 10 | 10 | None in `lib/` |
+| `raw` / XSS | 10 | 10 | None in `lib/` |
+| secrets | 15 | 10 | Prod env OK; DB SSL operator-misconfig; no filter_parameters |
+| **Total** | **100** | **80** | Grade **B** |
 
----
+## Issues found
 
-## Critical Vulnerabilities
+### P1
 
-*None found in application code paths reviewed.*  
-No SQL interpolation of user input, no `String.to_atom/1` on input, no `raw/1` / unsafe term decode, no unscoped MCP reads.
+#### 1. Rate-limit ETS table not supervised — effectively per-connection
+- **Location:** `lib/elx_mcp/auth/rate_limit.ex:12-28`, `lib/elx_mcp_web/plugs/mcp_auth.ex:20`
+- **Issue:** `setup!/0` creates a **named public ETS table owned by the calling process**. Only callers are `check/2` and `reset!/0` (tests). Not started from `ElxMcp.Application`. When the HTTP connection process that first created the table exits, the table is **deleted**. Counters do not accumulate across independent connections; abuse protection is largely ineffective in production. Atomic `update_counter/4` is correct **within** a live table, but table lifetime is wrong.
+- **Also:** IP-only key (`"mcp:" <> remote_ip`), single-node, no prune of old `{key,bucket}` rows, no trusted-proxy / `x-forwarded-for` handling.
+- **Fix:** Create table once in Application (or dedicated GenServer owner with heir); prune stale buckets; key by IP pre-auth + `api_key_id` post-auth; multi-node → Redis/Hammer; configure remote IP behind LB.
 
----
+#### 2. MCP sessions not bound to `api_key_id` / project
+- **Location:** `lib/elx_mcp_web/plugs/mcp_auth.ex` (auth only); Anubis `StreamableHTTP.Plug` `handle_delete/2` (~452), `get_or_create_session_id/2` (~595), `merge_transport_assigns/2` in `session.ex` (~836)
+- **Issue:** Every POST re-auths and `merge_transport_assigns` overwrites frame assigns from `conn.assigns` — **tool data stays tenant-correct**. However session lifecycle (SSE register, restore, **DELETE**) is keyed only by `mcp-session-id`. Any authenticated principal who knows/guesses a session id can terminate another client’s session or attach SSE. Clients may supply their own session header on initialize. Anubis IDs use **24-bit pure random** + timestamp + phash2 (~48 bits practical entropy), not ≥128-bit.
+- **OWASP:** A01 / A07  
+- **Fix:** Bind session → `{api_key_id, project_id}` at create; reject DELETE/SSE on mismatch; prefer high-entropy session ids if customizing transport.
 
-## High
+### P2
 
-### 1. DB TLS defaults to certificate verification off
+#### 3. API keys never expire
+- **Location:** `lib/elx_mcp/auth/api_key.ex`, `lib/elx_mcp/auth.ex:111-116` (only `is_nil(revoked_at)`)
+- **Issue:** Compromised keys remain valid until manual revoke. No `expires_at` / rotation SLA.
+- **Fix:** Nullable `expires_at`; filter in `fetch_active_key/1`; rotate via `mix elx_mcp.gen_api_key` + revoke.
 
-- **Severity**: High  
-- **Location**: `config/runtime.exs` (`DB_SSL` default `"verify_none"`)  
-- **Issue**: Postgres SSL is enabled with `verify: :verify_none` unless operators set `DB_SSL=true`. A network attacker (or compromised proxy) can MITM the DB connection and observe/modify tenant data and `key_hash` rows.  
-- **OWASP**: A02 Cryptographic Failures  
-- **Fix**:
+#### 4. Latent tenant write hazard — schemas cast `:project_id`
+- **Location:**  
+  - `lib/elx_mcp/projects/{board,component,sprint,epic,user_story}.ex` (cast includes `:project_id`)  
+  - `lib/elx_mcp/collaboration/{comment,attachment,worklog,changelog}.ex`  
+  - Contexts: `create_*` take bare `project_id` not `%Scope{}` (`projects.ex:15+`, `collaboration.ex:13+`)  
+  - Ticket correctly uses `put_change` only (`ticket.ex:59`)
+- **Issue:** Contexts currently `Map.put(:project_id, …)` so atom key wins today. No MCP write tools yet. Future `project:write` tools that pass client attrs risk mass-assignment IDOR.
+- **Fix:** Never cast `:project_id`/`:key`; set only via `put_change/3` from `%Scope{}`; prefer `create_*(%Scope{}, attrs)`.
 
-```elixir
-# Prefer verify peer in prod; only allow verify_none via explicit opt-in
-case {config_env(), System.get_env("DB_SSL", "true")} do
-  {:prod, v} when v in ~w(true 1 yes) ->
-    [verify: :verify_peer, cacertfile: System.fetch_env!("DB_CA_CERT")]
-  {_, "verify_none"} ->
-    [verify: :verify_none]  # dev/test only
-  ...
-end
-```
+#### 5. Prod DB TLS operator-misconfigurable
+- **Location:** `config/runtime.exs:71-94`
+- **Issue:** Default in prod is good (`DB_SSL` default `"true"`). Still allows `DB_SSL=false` without warning; `verify_none` only warns. `ssl: true` alone may not set explicit `verify: :verify_peer` + CA path on all platforms.
+- **Fix:** Hard-fail insecure flags in prod unless explicit opt-in env; document CA bundle.
 
-Document required `DB_CA_CERT` / platform CA bundle for managed Postgres.
+#### 6. `project:write` scope unused / not re-checked on future writes
+- **Location:** `lib/elx_mcp/catalog.ex:13`, `auth.ex:58` (requires only `project:read`)
+- **Issue:** Write scope exists in catalog but is never enforced. When write tools land, each handler must `Scope.has_scope?(scope, "project:write")`.
 
----
+### P3
 
-## Medium
+#### 7. Auth timing surface + email as non-secret factor
+- **Location:** `lib/elx_mcp/auth.ex:49-88`
+- **Issue:** Invalid hex fails before DB; missing key skips email compare. Length-mismatched emails short-circuit before `secure_compare`. Email is guessable; security rests on 256-bit key (acceptable).
 
-### 2. MCP sessions not bound to `api_key_id` / weak session ID entropy
+#### 8. CORS advertises methods/headers even when Origin not allowlisted
+- **Location:** `lib/elx_mcp_web/plugs/cors.ex:14-21`
+- **Issue:** `Allow-Methods/Headers` always set; only `Allow-Origin` is conditional. Prod refuses `*` unless `allow_cors_star` (false by default). No `Allow-Credentials`.
 
-- **Severity**: Medium  
-- **Location**: `ElxMcpWeb.Plugs.MCPAuth` + Anubis `StreamableHTTP.Plug` / `Anubis.MCP.ID.generate_session_id/0`  
-- **Issue**:
-  1. Every request re-auths (good), but **session lifecycle** (SSE register, restore, **DELETE**) is keyed only by `mcp-session-id`, not by the authenticated key/tenant.
-  2. Anubis session IDs use **24 bits of pure random** plus timestamp/phash2 — far weaker than the API key. A leaked or guessed session id from any authenticated principal can **terminate** another client’s session (`DELETE /mcp`) or attach to shared session process state.
-- **OWASP**: A01 Broken Access Control / A07 Identification & Auth Failures  
-- **Fix**:
-  - Bind session → `{api_key_id, project_id}` at create; reject or re-key if headers disagree.
-  - On DELETE/GET SSE, require same binding.
-  - Prefer cryptographically random session ids (e.g. 128-bit+) if configuring/customizing transport.
+#### 9. Mix tasks print plaintext keys to stdout
+- **Location:** `lib/mix/tasks/elx_mcp.gen_api_key.ex`, `lib/mix/tasks/elx_mcp.create_project.ex`
+- **Issue:** Shell history / CI logs can retain secrets (expected for CLI issuance).
 
-### 3. Rate limiter: IP-only, non-atomic, non-distributed
+#### 10. No structured auth audit trail
+- **Location:** Auth / MCPAuth  
+- **Issue:** No persistent failed-auth / revoke events beyond debounced `last_used_at`.
 
-- **Severity**: Medium  
-- **Location**: `lib/elx_mcp/auth/rate_limit.ex`, used from `mcp_auth.ex`  
-- **Issue**:
-  - Cap is **per `remote_ip` only** (not per key/email) — shared NATs throttle everyone; distributed keys behind one IP share budget.
-  - ETS read-modify-write is **not atomic** under concurrency (limit can be exceeded).
-  - Table is **local** — multi-node deployments multiply effective budget.
-  - No `x-forwarded-for` / trusted-proxy handling; behind reverse proxies without Bandit/`remote_ip` config, many clients may share one IP (or rate limit becomes ineffective if IP is always the LB).
-  - Unbounded keys in ETS (one entry per IP forever, filtered list only) → memory pressure under IP churn.
-- **OWASP**: A04 Insecure Design / availability  
-- **Fix**: Atomic counters (`:ets.update_counter` or Hammer/Nebulex), key by `{ip, api_key_id}` after auth (and stricter bucket on failed auth), configure trusted proxies, periodic prune or TTL.
+#### 11. Anubis context still carries remaining `req_headers`
+- **Location:** Anubis `build_request_context` after MCPAuth scrub  
+- **Issue:** Key/email headers deleted before forward (good). Avoid logging `frame.context` / headers in prod.
 
-### 4. API keys never expire
+#### 12. Browser session cookie not production-hardened (low impact for MCP)
+- **Location:** `lib/elx_mcp_web/endpoint.ex:7-12`  
+- **Issue:** Cookie session lacks explicit `secure: true` / `http_only: true` (http_only is Plug default true). MCP auth is header-based, not cookie-based.
 
-- **Severity**: Medium  
-- **Location**: `lib/elx_mcp/auth/api_key.ex`, `auth.ex` (only `revoked_at`)  
-- **Issue**: Compromised keys remain valid indefinitely until manual revoke. No `expires_at`, rotation policy, or max lifetime.  
-- **OWASP**: A07  
-- **Fix**: Add `expires_at`; enforce in `fetch_active_key/1`; document rotation via `mix elx_mcp.gen_api_key` + revoke old.
+#### 13. ILIKE escape without explicit SQL `ESCAPE`
+- **Location:** `lib/elx_mcp/projects.ex:246-283`, `escape_like/1:427-432`  
+- **Issue:** Pattern is parameterized (`^pattern`) — no SQLi. Wildcard escape relies on PG default `\`; within-tenant over-match only if escape ineffective. Not cross-tenant.
 
-### 5. Latent tenant write hazard: `project_id` is castable
+#### 14. `mix sobelow` not in project
+- **Issue:** Cannot automate static security scan in CI. Recommend adding `:sobelow` and running `mix sobelow --exit medium`.
 
-- **Severity**: Medium (latent — no MCP write tools today)  
-- **Location**: `Projects.*` / `Collaboration.*` changesets cast `:project_id`; create helpers take raw `project_id`  
-- **Issue**: Schemas allow client-supplied `project_id` in `cast/3`. Contexts currently `Map.put(:project_id, project_id)`, which is usually safe, but dual string/atom keys in attrs can make Ecto param conversion ambiguous. When `project:write` tools are added, mass-assignment IDOR is a high risk.  
-- **OWASP**: A01  
-- **Fix**: Never cast `:project_id`; set only via `put_change/3` from `%Scope{}`. Prefer `create_*(%Scope{}, attrs)` signatures for all mutations.
+## Clean areas (one line)
 
----
+Dual-header verify + SHA-256 hash-at-rest + `Plug.Crypto.secure_compare` email; header scrub of key/email; all MCP tools/resources use `with_scope`/`scope_from_frame` + `project_id == ^`; no `String.to_atom`/`raw`/interpolated SQL; prod `SECRET_KEY_BASE` required; `.env` gitignored; CORS star gated to dev; Ticket `project_id` not cast; force_ssl in prod.exs.
 
-## Low
+## Auth plug trace (verification)
 
-### 6. `X-Email` is not a secret second factor
+| Check | Result |
+|-------|--------|
+| Both `X-API-Key` + `X-Email` required | ✅ `mcp_auth.ex:34-37` → `verify_api_key/2` |
+| Hex format 64 chars | ✅ `valid_hex_key?/1` |
+| SHA-256 of raw 32 bytes | ✅ `create` + `verify` |
+| Lookup active + not revoked | ✅ `fetch_active_key/1` |
+| Email normalize + constant-time when lengths match | ✅ |
+| Requires `project:read` in scopes | ✅ |
+| Assigns scope, deletes secret headers | ✅ |
+| Rate limit before auth | ⚠️ present but ETS owner broken (P1) |
 
-- **Severity**: Low  
-- **Location**: `auth.ex` / `mcp_auth.ex`  
-- **Issue**: Email is often known or guessable; control mainly prevents key reuse across emails and forces dual headers. Security still rests almost entirely on the 256-bit key.  
-- **Note**: Timing-safe compare is used when lengths match; length mismatch short-circuits (minor timing signal).
+## Tenant isolation (MCP)
 
-### 7. Auth failure timing / enumeration surface
-
-- **Severity**: Low  
-- **Location**: `Auth.verify_api_key/2`  
-- **Issue**: Invalid hex fails before DB; valid hex + missing key skips email compare; wrong email does compare. Small timing differences may leak “key exists”. Acceptable for high-entropy keys; avoid logging success/failure distinctions that aid targeting.
-
-### 8. CORS always advertises methods/headers
-
-- **Severity**: Low  
-- **Location**: `lib/elx_mcp_web/plugs/cors.ex`  
-- **Issue**: `Access-Control-Allow-Methods/Headers` are set even when Origin is not allowlisted (only ACAO is conditional). Minor recon aid. Prod correctly refuses `*` unless `allow_cors_star` (false by default).  
-- **Positive**: `x-api-key` / `x-email` allowed only for configured origins; no `Allow-Credentials: true`.
-
-### 9. Mix tasks print plaintext keys to stdout
-
-- **Severity**: Low (operational)  
-- **Location**: `mix elx_mcp.gen_api_key`, `mix elx_mcp.create_project`  
-- **Issue**: Shell history / CI logs can retain secrets. Expected for CLI issuance; warn operators; prefer secret managers for prod.
-
-### 10. No structured auth audit trail
-
-- **Severity**: Low  
-- **Location**: Auth / MCPAuth  
-- **Issue**: No persistent log of failed auth, revoke, or key use beyond debounced `last_used_at`. Hinders incident response.
-
-### 11. `project:write` scope exists without enforcement surface
-
-- **Severity**: Low  
-- **Location**: `Catalog.scopes/0`, verify requires `project:read` only  
-- **Issue**: Write scope is unused by tools. Future write tools must re-check `Scope.has_scope?(scope, "project:write")` on every handler — do not rely on mount-time assigns alone.
-
----
-
-## Positive controls (summary)
-
-Checked and clean enough not to expand: dual-header verify + SHA-256 of 32-byte keys; email normalize + `Plug.Crypto.secure_compare/2`; revoke + soft-delete filter; strip `x-api-key`/`x-email` before Anubis context; all MCP tools/resources use `Helpers.with_scope` / `scope_from_frame` + context `where: project_id == ^…`; LIKE wildcards escaped; prod CORS allowlist + no bare `*`; `SECRET_KEY_BASE` required in prod; `.env` gitignored; force_ssl/HSTS in `prod.exs`.
-
----
-
-## Recommendations (priority)
-
-1. **P0**: Require verified DB TLS in production (`DB_SSL` + CA).  
-2. **P1**: Bind MCP sessions to `api_key_id`/`project_id`; harden session id entropy.  
-3. **P1**: Replace ETS rate limiter with atomic, multi-node-aware limiter; trust proxy config.  
-4. **P2**: API key expiry + rotation runbook.  
-5. **P2**: Stop casting `project_id`; Scope-first write APIs before any write tools.  
-6. **P3**: Auth audit events; tighten CORS header emission to allowlisted origins only.
+All tools under `lib/elx_mcp/mcp/tools/*` and resources under `resources/*` call `Helpers.with_scope` / `scope_from_frame` then `Projects.*` / `Collaboration.*` with `%Scope{}`. List/get/search filter `project_id == ^project_id`. No client-supplied `project_id` on read path.
 
 ## Tools to run manually
 
-- `mix sobelow --exit medium`  
-- `mix deps.audit` / `mix hex.audit`  
-- Penetration: cross-tenant tool calls with key A against entity keys from project B (expect not_found)  
+- `mix sobelow --exit medium` (add dep first)
+- `mix deps.audit` / `mix hex.audit`
+- Cross-tenant: key A + entity keys from project B → expect not_found
 - Confirm prod env: `DB_SSL`, `MCP_CORS_ORIGINS`, `SECRET_KEY_BASE`, no `allow_cors_star`
+- Prove rate-limit across two separate TCP connections (expect failure today if ETS dies with first conn)
+
+## Recommendations (priority)
+
+1. **P1:** Own rate-limit ETS from Application; then multi-node + trusted proxy.  
+2. **P1:** Bind MCP sessions to `api_key_id`/`project_id`; harden session id entropy.  
+3. **P2:** Key expiry + rotation runbook.  
+4. **P2:** Stop casting `project_id` on all schemas before any write tools.  
+5. **P2:** Harden prod DB SSL flags.  
+6. **P3:** Auth audit events; CORS allow-* only for allowlisted origins; add sobelow to CI.

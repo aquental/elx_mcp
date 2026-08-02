@@ -8,22 +8,25 @@ defmodule ElxMcp.CollaborationTest do
 
   setup do
     {:ok, project} = Tenancy.create_project(%{key: "COL", name: "Collab"})
-    {:ok, story} = Projects.create_user_story(project.id, %{title: "S"})
-    {:ok, ticket} = Projects.create_ticket(project.id, %{title: "T", user_story_id: story.id})
 
-    scope = %Scope{
+    write_scope = %Scope{
       project_id: project.id,
       actor_email: "c@example.com",
       api_key_id: Ecto.UUID.generate(),
-      scopes: ["project:read"]
+      scopes: ["project:read", "project:write"]
     }
 
-    %{project: project, ticket: ticket, scope: scope}
+    read_scope = %{write_scope | scopes: ["project:read"]}
+
+    {:ok, story} = Projects.create_user_story(write_scope, %{title: "S"})
+    {:ok, ticket} = Projects.create_ticket(write_scope, %{title: "T", user_story_id: story.id})
+
+    %{project: project, ticket: ticket, scope: read_scope, write_scope: write_scope}
   end
 
-  test "comments and changelog", %{project: project, ticket: ticket, scope: scope} do
+  test "comments and changelog", %{ticket: ticket, scope: scope, write_scope: write_scope} do
     assert {:ok, _} =
-             Collaboration.create_comment(project.id, %{
+             Collaboration.create_comment(write_scope, %{
                commentable_type: "ticket",
                commentable_id: ticket.id,
                author_email: "c@example.com",
@@ -33,7 +36,7 @@ defmodule ElxMcp.CollaborationTest do
     assert [_] = Collaboration.list_comments(scope, "ticket", ticket.id)
 
     assert {:ok, _} =
-             Collaboration.record_changelog(project.id, %{
+             Collaboration.record_changelog(write_scope, %{
                entity_type: "ticket",
                entity_id: ticket.id,
                field: "status",
@@ -45,15 +48,15 @@ defmodule ElxMcp.CollaborationTest do
     assert [_] = Collaboration.list_changelog(scope, "ticket", ticket.id)
   end
 
-  test "worklog updates ticket time", %{project: project, ticket: ticket} do
+  test "worklog updates ticket time", %{ticket: ticket, write_scope: write_scope} do
     assert {:ok, _} =
-             Collaboration.create_worklog(project.id, ticket.id, %{
+             Collaboration.create_worklog(write_scope, ticket.id, %{
                author_email: "c@example.com",
                time_spent_seconds: 3600
              })
 
     assert {:ok, _} =
-             Collaboration.create_worklog(project.id, ticket.id, %{
+             Collaboration.create_worklog(write_scope, ticket.id, %{
                author_email: "c@example.com",
                time_spent_seconds: 1800
              })
@@ -63,12 +66,12 @@ defmodule ElxMcp.CollaborationTest do
   end
 
   test "attachment create and cross-tenant isolation", %{
-    project: project,
     ticket: ticket,
-    scope: scope
+    scope: scope,
+    write_scope: write_scope
   } do
     assert {:ok, _} =
-             Collaboration.create_attachment(project.id, %{
+             Collaboration.create_attachment(write_scope, %{
                attachable_type: "ticket",
                attachable_id: ticket.id,
                filename: "a.txt",
@@ -76,7 +79,7 @@ defmodule ElxMcp.CollaborationTest do
              })
 
     assert {:ok, _} =
-             Collaboration.create_comment(project.id, %{
+             Collaboration.create_comment(write_scope, %{
                commentable_type: "ticket",
                commentable_id: ticket.id,
                author_email: "c@example.com",
@@ -95,5 +98,50 @@ defmodule ElxMcp.CollaborationTest do
     assert [] = Collaboration.list_comments(other_scope, "ticket", ticket.id)
     assert [] = Collaboration.list_changelog(other_scope, "ticket", ticket.id)
     assert length(Collaboration.list_comments(scope, "ticket", ticket.id)) >= 1
+  end
+
+  test "create_comment requires project:write", %{ticket: ticket, scope: scope} do
+    assert {:error, :forbidden} =
+             Collaboration.create_comment(scope, %{
+               commentable_type: "ticket",
+               commentable_id: ticket.id,
+               author_email: "c@example.com",
+               body: "nope"
+             })
+  end
+
+  test "create_comment rejects foreign entity id", %{write_scope: write_scope} do
+    {:ok, other} = Tenancy.create_project(%{key: "FOR", name: "Foreign"})
+
+    other_write = %Scope{
+      project_id: other.id,
+      actor_email: "o@example.com",
+      api_key_id: Ecto.UUID.generate(),
+      scopes: ["project:read", "project:write"]
+    }
+
+    {:ok, story} = Projects.create_user_story(other_write, %{title: "S"})
+
+    {:ok, foreign_ticket} =
+      Projects.create_ticket(other_write, %{title: "T", user_story_id: story.id})
+
+    assert {:error, :invalid_association} =
+             Collaboration.create_comment(write_scope, %{
+               commentable_type: "ticket",
+               commentable_id: foreign_ticket.id,
+               body: "cross"
+             })
+  end
+
+  test "forces author_email from scope", %{ticket: ticket, write_scope: write_scope} do
+    assert {:ok, comment} =
+             Collaboration.create_comment(write_scope, %{
+               commentable_type: "ticket",
+               commentable_id: ticket.id,
+               author_email: "spoofed@evil.com",
+               body: "hi"
+             })
+
+    assert comment.author_email == write_scope.actor_email
   end
 end

@@ -26,7 +26,7 @@ defmodule ElxMcp.MCP.Tools.ListSprints do
         |> Keyword.put(:limit, params[:limit] || 100)
 
       data = Projects.list_sprints(scope, opts) |> Enum.map(&Helpers.encode_struct/1)
-      Helpers.emit_tool("list_sprints", scope.project_id, start, :ok)
+      Helpers.emit_tool("list_sprints", scope, start, :ok, params)
       Helpers.json_reply(frame, %{sprints: data})
     end)
   end

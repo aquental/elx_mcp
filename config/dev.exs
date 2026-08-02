@@ -3,7 +3,9 @@ import Config
 # DB credentials come from .env / env vars via config/runtime.exs
 config :elx_mcp,
   mcp_cors_origins: ["*"],
-  allow_cors_star: true
+  allow_cors_star: true,
+  # Log every MCP tool invocation to the console (see ElxMcp.MCP.Helpers.emit_tool/5)
+  log_mcp_tools: true
 
 config :elx_mcp, ElxMcp.Repo,
   stacktrace: true,

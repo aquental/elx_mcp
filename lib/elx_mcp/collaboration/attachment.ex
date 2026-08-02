@@ -26,7 +26,6 @@ defmodule ElxMcp.Collaboration.Attachment do
   def changeset(attachment, attrs) do
     attachment
     |> cast(attrs, [
-      :project_id,
       :attachable_type,
       :attachable_id,
       :filename,
@@ -35,13 +34,14 @@ defmodule ElxMcp.Collaboration.Attachment do
       :storage_path,
       :uploaded_by_email
     ])
+    # :project_id set via put_change in context
     |> validate_required([
-      :project_id,
       :attachable_type,
       :attachable_id,
       :filename,
       :storage_path
     ])
     |> validate_inclusion(:attachable_type, Catalog.linkable_types())
+    |> foreign_key_constraint(:project_id)
   end
 end

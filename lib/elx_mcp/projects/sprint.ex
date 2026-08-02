@@ -26,8 +26,8 @@ defmodule ElxMcp.Projects.Sprint do
 
   def changeset(sprint, attrs) do
     sprint
-    |> cast(attrs, [:name, :goal, :status, :start_on, :end_on, :metadata, :project_id, :board_id])
-    |> validate_required([:name, :project_id])
+    |> cast(attrs, [:name, :goal, :status, :start_on, :end_on, :metadata, :board_id])
+    |> validate_required([:name])
     |> validate_inclusion(:status, Catalog.sprint_statuses())
     |> foreign_key_constraint(:project_id)
     |> foreign_key_constraint(:board_id)

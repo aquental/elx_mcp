@@ -26,7 +26,7 @@ defmodule ElxMcp.MCP.Tools.ListEpics do
         |> maybe_put(:limit, params[:limit] || 50)
 
       data = Projects.list_epics(scope, opts) |> Enum.map(&Helpers.encode_struct/1)
-      Helpers.emit_tool("list_epics", scope.project_id, start, :ok)
+      Helpers.emit_tool("list_epics", scope, start, :ok, params)
       Helpers.json_reply(frame, %{epics: data})
     end)
   end

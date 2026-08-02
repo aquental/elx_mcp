@@ -1,11 +1,12 @@
 defmodule ElxMcp.MCP.Helpers do
   @moduledoc false
 
+  require Logger
+
   alias Anubis.Server.Response
   alias ElxMcp.Auth.Scope
 
   @drop_always ~w(__meta__)a
-  # Parent associations that create deep/circular graphs — keep id only via fields already on struct
   @drop_parents ~w(project parent_ticket)a
 
   def scope_from_frame(frame) do
@@ -47,6 +48,7 @@ defmodule ElxMcp.MCP.Helpers do
         fun.(scope)
 
       nil ->
+        log_tool("?", nil, nil, %{}, :unauthorized, 0)
         {:reply, Response.error(Response.tool(), "Unauthorized / Não autorizado"), frame}
     end
   end
@@ -59,14 +61,49 @@ defmodule ElxMcp.MCP.Helpers do
     {:reply, Response.error(Response.tool(), message), frame}
   end
 
-  def emit_tool(tool, project_id, start_ms, result) do
+  @doc """
+  Emit telemetry and (in dev) console log after a tool finishes.
+  """
+  def emit_tool(tool, scope_or_project_id, start_ms, result, params \\ %{})
+
+  def emit_tool(tool, %Scope{} = scope, start_ms, result, params) do
     duration = System.monotonic_time(:millisecond) - start_ms
 
     :telemetry.execute(
       [:elx_mcp, :mcp, :tool, :stop],
       %{duration_ms: duration},
-      %{tool: tool, project_id: project_id, result: result}
+      %{
+        tool: tool,
+        project_id: scope.project_id,
+        email: scope.actor_email,
+        result: result,
+        params: params
+      }
     )
+
+    log_tool(tool, scope.project_id, scope.actor_email, params, result, duration)
+  end
+
+  def emit_tool(tool, project_id, start_ms, result, params) do
+    duration = System.monotonic_time(:millisecond) - start_ms
+
+    :telemetry.execute(
+      [:elx_mcp, :mcp, :tool, :stop],
+      %{duration_ms: duration},
+      %{tool: tool, project_id: project_id, result: result, params: params}
+    )
+
+    log_tool(tool, project_id, nil, params, result, duration)
+  end
+
+  defp log_tool(tool, project_id, email, params, result, duration_ms) do
+    if Application.get_env(:elx_mcp, :log_mcp_tools, false) do
+      Logger.info(fn ->
+        "[MCP tool] #{tool} result=#{inspect(result)} " <>
+          "duration_ms=#{duration_ms} project_id=#{inspect(project_id)} " <>
+          "email=#{inspect(email)} params=#{inspect(params || %{}, limit: 40)}"
+      end)
+    end
   end
 
   def encode_struct(struct) when is_struct(struct) do

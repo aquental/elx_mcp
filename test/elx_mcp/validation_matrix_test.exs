@@ -30,18 +30,26 @@ defmodule ElxMcp.ValidationMatrixTest do
     assert {:ok, "VAL-1"} = Tenancy.next_issue_key(p.id)
     assert {:ok, "VAL-2"} = Tenancy.next_issue_key(p.id)
 
+    write_scope = %ElxMcp.Auth.Scope{
+      project_id: p.id,
+      actor_email: "v@example.com",
+      api_key_id: Ecto.UUID.generate(),
+      scopes: ["project:read", "project:write"]
+    }
+
     # V03 story without epic
-    assert {:ok, story} = Projects.create_user_story(p.id, %{title: "s"})
+    assert {:ok, story} = Projects.create_user_story(write_scope, %{title: "s"})
     assert is_nil(story.epic_id)
 
     # V04 ticket without story rejected
-    assert {:error, _} = Projects.create_ticket(p.id, %{title: "t"})
+    assert {:error, _} = Projects.create_ticket(write_scope, %{title: "t"})
 
     # V05 subtask parent
-    {:ok, parent} = Projects.create_ticket(p.id, %{title: "parent", user_story_id: story.id})
+    {:ok, parent} =
+      Projects.create_ticket(write_scope, %{title: "parent", user_story_id: story.id})
 
     assert {:ok, _sub} =
-             Projects.create_ticket(p.id, %{
+             Projects.create_ticket(write_scope, %{
                title: "sub",
                type: "subtask",
                user_story_id: story.id,
