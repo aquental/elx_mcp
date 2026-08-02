@@ -24,7 +24,7 @@ A camada de aplicação (API keys SHA-256, escopo por `project_id`, rate limit M
 | Escopo de privilégios (multi-DB + CREATEROLE) | Alto |
 | TLS sem verificação de certificado na app (`verify_none`) | Alto |
 | Isolamento multi-tenant no PG (sem RLS) | Médio (defesa em profundidade) |
-| Segredos cifrados versionados (`.env.gpg`) | Médio |
+| Segredos cifrados versionados (`.env.gpg`) | **Mitigado (v1.8):** removido do tracking; ainda pode existir no histórico git |
 | Auth MCP / API keys / queries Ecto | Razoável — manter |
 
 **Score orientativo de risco de acesso ao DB (auditoria):** ~18/100 (quanto menor, pior o risco residual de exposição).
@@ -152,7 +152,7 @@ Regra de ouro:
 | - | ---- | ----- |
 | 6 | Role dedicado por app (`elx_mcp_app`) + grants mínimos | Opcional migrator separado em CI/prod |
 | 7 | App com `DB_SSL=true` + CA confiável; eliminar `verify_none` fora de lab local | **Feito (v1.4):** peer verify + `DB_SSL_CA` hermes |
-| 8 | Política de `.env.gpg`: não versionar se remoto amplo; ou GPG assimétrico; **rotacionar** se já commitado | Ver §7 |
+| 8 | Política de `.env.gpg`: não versionar se remoto amplo; ou GPG assimétrico; **rotacionar** se já commitado | **Feito (v1.8):** `.gitignore` + `git rm --cached`; histórico antigo ainda tem o blob |
 | 9 | Logs de autenticação + monitoramento de falhas | **Feito (v1.4):** `log_connections` / collector no hermes |
 | 10 | Remover defaults `postgres`/`postgres` no `runtime.exs` | **Feito (v1.2):** falha se faltar `DB_USER`/`DB_PASSWORD`/`DB_HOST` |
 
@@ -293,7 +293,7 @@ Complementar com firewall rate-limit / fail2ban no host, se exposto a qualquer r
 | -------- | -------- |
 | `.env` | **Nunca** commitar (já no `.gitignore`) |
 | `.env.example` | Só placeholders; sem senhas reais |
-| `.env.gpg` | Preferir **não** versionar se o remoto for público ou equipe ampla; se versionar, passphrase forte e exclusiva; considerar GPG assimétrico |
+| `.env.gpg` | **Nunca** versionar (`.gitignore`). Cópia local opcional via `mix elx_mcp.env.encrypt`. Histórico git antigo pode ainda conter blobs — rotacionar credenciais se o repo for/foi público |
 | `ELX_MCP_GPG_PASSPHRASE` | Nunca no git; não logar |
 | `SECRET_KEY_BASE` | Dev pode ser local; **nunca** reutilizar valor de `dev.exs` em prod |
 | `DATABASE_URL` / `DB_PASSWORD` | Secret manager em CI/prod |
@@ -358,7 +358,7 @@ mix phx.server
 | Role dedicado owner de `elx_mcp_*` | OK se owner/DDL | Alta | P1 |
 | `DB_SSL=true` + CA | **Feito** (CA pin + hostname) | Alta | P1 ✅ |
 | Remover defaults `postgres`/`postgres` | **Feito** — exige `.env` / env completo | Média | P1 ✅ |
-| Remover `.env.gpg` do git / rotacionar | Operacional | Média | P1 |
+| Remover `.env.gpg` do git / rotacionar | **Removido do tree (v1.8)**; rotação de passphrase/histórico opcional | Média | P1 ✅ |
 | `NOCREATEDB` + DBs pré-criados | OK se bootstrap feito | Média | P2 |
 | RLS por `project_id` | Não obrigatório MVP | Defesa em profundidade | P2 |
 | Logs de conexão/auth | **Feito** no hermes | Média | P2 ✅ |
@@ -450,3 +450,4 @@ Revalidar com o checklist do §9 após qualquer mudança de rede/IP.
 | v1.5 | 2026-08-02 | Role `aquental` endurecido; backup cifrado + restore verificado (`mix db.backup*`) |
 | v1.6 | 2026-08-02 | CIS (limits/logging/check); FORCE RLS + tenant GUC + bypass GUC |
 | v1.7 | 2026-08-02 | CI Option C: GitHub Actions Secrets + Postgres service (`ci.yml`) |
+| v1.8 | 2026-08-02 | `.env.gpg` removido do tracking git (permanece só local + `.gitignore`) |

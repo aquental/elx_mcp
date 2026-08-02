@@ -39,17 +39,19 @@ substituir a biblioteca.
 
 ### Segredos locais (`.env`)
 
-O arquivo **`.env`** (valores reais) não deve ir para o git. Use **`.env.example`** como template e, se quiser versionar o segredo de forma cifrada, **`.env.gpg`**.
+O arquivo **`.env`** (valores reais) **não** deve ir para o git. Use **`.env.example`** como template.
+
+**`.env.gpg` também não é versionado** (está no `.gitignore`). Serve só como backup cifrado **local** (ou em cofre/secret manager), nunca no repositório.
 
 ```bash
-# Cifrar .env → .env.gpg (AES-256 + S2K SHA-512)
+# Backup local cifrado (opcional; o arquivo fica fora do git)
 mix elx_mcp.env.encrypt
 mix elx_mcp.env.encrypt --force
 
-# Decifrar .env.gpg → .env
+# Restaurar .env a partir do backup local
 mix elx_mcp.env.decrypt --force
 
-# Sem prompt (CI / terminal sem TTY):
+# Sem prompt (terminal sem TTY):
 export ELX_MCP_GPG_PASSPHRASE='sua-passphrase-forte'
 mix elx_mcp.env.encrypt --force
 unset ELX_MCP_GPG_PASSPHRASE
