@@ -7,6 +7,9 @@ defmodule ElxMcp.Projects do
 
   `get_*` preloads at most 50 child associations by default (`:child_limit`, max 200).
   Full child enumeration uses `list_*` with filters.
+
+  Internal helpers (not Scope HTTP surface): `increment_time_spent/3` is for
+  Collaboration Multi only (`@doc false`).
   """
 
   import Ecto.Query
@@ -328,7 +331,9 @@ defmodule ElxMcp.Projects do
     end
   end
 
-  @doc "Atomically increment ticket time_spent_seconds (used by worklogs)."
+  # Called only from Collaboration Multi under an existing with_tenant.
+  # Not part of the public Scope-based HTTP/MCP surface.
+  @doc false
   def increment_time_spent(project_id, ticket_id, seconds)
       when is_integer(seconds) and seconds > 0 do
     tenant(project_id, fn ->
@@ -338,6 +343,33 @@ defmodule ElxMcp.Projects do
 
       if count == 1, do: :ok, else: {:error, :not_found}
     end)
+  end
+
+  @doc """
+  Ensures an entity id belongs to `project_id` (for collab / cross-context checks).
+
+  Must run under the same RLS tenant as `project_id` (caller's `with_tenant` or nested).
+  Types: `"epic" | "user_story" | "ticket"`.
+  """
+  def ensure_entity_in_project(_project_id, type, id) when is_nil(type) or is_nil(id),
+    do: {:error, :invalid_association}
+
+  def ensure_entity_in_project(project_id, "epic", id),
+    do: entity_exists?(Epic, id, project_id)
+
+  def ensure_entity_in_project(project_id, "user_story", id),
+    do: entity_exists?(UserStory, id, project_id)
+
+  def ensure_entity_in_project(project_id, "ticket", id),
+    do: entity_exists?(Ticket, id, project_id)
+
+  def ensure_entity_in_project(_, _, _), do: {:error, :invalid_association}
+
+  defp entity_exists?(schema, id, project_id) do
+    exists? =
+      Repo.exists?(from r in schema, where: r.id == ^id and r.project_id == ^project_id)
+
+    if exists?, do: :ok, else: {:error, :invalid_association}
   end
 
   def list_tickets(%Scope{project_id: project_id} = scope, opts \\ []) do
@@ -415,37 +447,8 @@ defmodule ElxMcp.Projects do
       if q == "" do
         []
       else
-        escaped = escape_like(q)
-        exact_key = String.upcase(q)
-        prefix = escaped <> "%"
-        title_pattern = "%" <> escaped <> "%"
-
-        exact = search_exact_key(project_id, exact_key, limit)
-        remaining = limit - length(exact)
-
-        prefix_hits =
-          if remaining > 0 do
-            search_prefix_key(
-              project_id,
-              prefix,
-              remaining,
-              MapSet.new(Enum.map(exact, & &1.key))
-            )
-          else
-            []
-          end
-
-        remaining = limit - length(exact) - length(prefix_hits)
-        known = MapSet.new(Enum.map(exact ++ prefix_hits, & &1.key))
-
-        title_hits =
-          if remaining > 0 do
-            search_title(project_id, title_pattern, remaining, known, include_desc?)
-          else
-            []
-          end
-
-        exact ++ prefix_hits ++ title_hits
+        # Single ranked UNION ALL (≤1 RTT) instead of up to 9 sequential queries
+        search_ranked(project_id, q, limit, include_desc?)
       end
     end)
   end
@@ -470,101 +473,91 @@ defmodule ElxMcp.Projects do
 
   # --- Search helpers ---
 
-  defp search_exact_key(project_id, key, limit) do
-    epics =
-      from(e in Epic,
-        where: e.project_id == ^project_id and e.key == ^key,
-        select: %{type: "epic", key: e.key, title: e.title, status: e.status},
-        limit: ^limit
-      )
-      |> Repo.all()
+  # Rank: 0 exact key, 1 key prefix, 2 title/description. One UNION ALL RTT.
+  defp search_ranked(project_id, q, limit, include_desc?) do
+    escaped = escape_like(q)
+    exact_key = String.upcase(q)
+    prefix = escaped <> "%"
+    title_pattern = "%" <> escaped <> "%"
+    {:ok, bin} = Ecto.UUID.dump(project_id)
 
-    stories =
-      from(s in UserStory,
-        where: s.project_id == ^project_id and s.key == ^key,
-        select: %{type: "user_story", key: s.key, title: s.title, status: s.status},
-        limit: ^limit
-      )
-      |> Repo.all()
+    sql = """
+    SELECT type, key, title, status FROM (
+      SELECT DISTINCT ON (key) type, key, title, status, rank
+      FROM (
+        SELECT 'epic'::text AS type, key, title, status,
+          CASE
+            WHEN upper(key) = $2 THEN 0
+            WHEN key ILIKE $3 ESCAPE E'\\\\' THEN 1
+            WHEN title ILIKE $4 ESCAPE E'\\\\' THEN 2
+            WHEN $5::boolean AND COALESCE(description, '') ILIKE $4 ESCAPE E'\\\\' THEN 2
+            ELSE 9
+          END AS rank
+        FROM epics
+        WHERE project_id = $1::uuid
+          AND (
+            upper(key) = $2
+            OR key ILIKE $3 ESCAPE E'\\\\'
+            OR title ILIKE $4 ESCAPE E'\\\\'
+            OR ($5::boolean AND COALESCE(description, '') ILIKE $4 ESCAPE E'\\\\')
+          )
+        UNION ALL
+        SELECT 'user_story', key, title, status,
+          CASE
+            WHEN upper(key) = $2 THEN 0
+            WHEN key ILIKE $3 ESCAPE E'\\\\' THEN 1
+            WHEN title ILIKE $4 ESCAPE E'\\\\' THEN 2
+            WHEN $5::boolean AND COALESCE(description, '') ILIKE $4 ESCAPE E'\\\\' THEN 2
+            ELSE 9
+          END
+        FROM user_stories
+        WHERE project_id = $1::uuid
+          AND (
+            upper(key) = $2
+            OR key ILIKE $3 ESCAPE E'\\\\'
+            OR title ILIKE $4 ESCAPE E'\\\\'
+            OR ($5::boolean AND COALESCE(description, '') ILIKE $4 ESCAPE E'\\\\')
+          )
+        UNION ALL
+        SELECT 'ticket', key, title, status,
+          CASE
+            WHEN upper(key) = $2 THEN 0
+            WHEN key ILIKE $3 ESCAPE E'\\\\' THEN 1
+            WHEN title ILIKE $4 ESCAPE E'\\\\' THEN 2
+            WHEN $5::boolean AND COALESCE(description, '') ILIKE $4 ESCAPE E'\\\\' THEN 2
+            ELSE 9
+          END
+        FROM tickets
+        WHERE project_id = $1::uuid
+          AND (
+            upper(key) = $2
+            OR key ILIKE $3 ESCAPE E'\\\\'
+            OR title ILIKE $4 ESCAPE E'\\\\'
+            OR ($5::boolean AND COALESCE(description, '') ILIKE $4 ESCAPE E'\\\\')
+          )
+      ) hits
+      WHERE rank < 9
+      ORDER BY key, rank ASC
+    ) deduped
+    ORDER BY rank ASC,
+      CASE type WHEN 'epic' THEN 0 WHEN 'user_story' THEN 1 ELSE 2 END,
+      key ASC
+    LIMIT $6
+    """
 
-    tickets =
-      from(t in Ticket,
-        where: t.project_id == ^project_id and t.key == ^key,
-        select: %{type: "ticket", key: t.key, title: t.title, status: t.status},
-        limit: ^limit
-      )
-      |> Repo.all()
+    result =
+      Ecto.Adapters.SQL.query!(Repo, sql, [
+        bin,
+        exact_key,
+        prefix,
+        title_pattern,
+        include_desc?,
+        limit
+      ])
 
-    (epics ++ stories ++ tickets) |> Enum.take(limit)
-  end
-
-  defp search_prefix_key(project_id, prefix, limit, exclude_keys) do
-    epics =
-      from(e in Epic,
-        where: e.project_id == ^project_id and ilike(e.key, ^prefix),
-        select: %{type: "epic", key: e.key, title: e.title, status: e.status},
-        limit: ^limit
-      )
-      |> Repo.all()
-
-    stories =
-      from(s in UserStory,
-        where: s.project_id == ^project_id and ilike(s.key, ^prefix),
-        select: %{type: "user_story", key: s.key, title: s.title, status: s.status},
-        limit: ^limit
-      )
-      |> Repo.all()
-
-    tickets =
-      from(t in Ticket,
-        where: t.project_id == ^project_id and ilike(t.key, ^prefix),
-        select: %{type: "ticket", key: t.key, title: t.title, status: t.status},
-        limit: ^limit
-      )
-      |> Repo.all()
-
-    (epics ++ stories ++ tickets)
-    |> Enum.reject(&MapSet.member?(exclude_keys, &1.key))
-    |> Enum.take(limit)
-  end
-
-  defp search_title(project_id, pattern, limit, exclude_keys, include_desc?) do
-    epics =
-      from(e in Epic,
-        where:
-          e.project_id == ^project_id and
-            (ilike(e.title, ^pattern) or
-               (^include_desc? and ilike(e.description, ^pattern))),
-        select: %{type: "epic", key: e.key, title: e.title, status: e.status},
-        limit: ^limit
-      )
-      |> Repo.all()
-
-    stories =
-      from(s in UserStory,
-        where:
-          s.project_id == ^project_id and
-            (ilike(s.title, ^pattern) or
-               (^include_desc? and ilike(s.description, ^pattern))),
-        select: %{type: "user_story", key: s.key, title: s.title, status: s.status},
-        limit: ^limit
-      )
-      |> Repo.all()
-
-    tickets =
-      from(t in Ticket,
-        where:
-          t.project_id == ^project_id and
-            (ilike(t.title, ^pattern) or
-               (^include_desc? and ilike(t.description, ^pattern))),
-        select: %{type: "ticket", key: t.key, title: t.title, status: t.status},
-        limit: ^limit
-      )
-      |> Repo.all()
-
-    (epics ++ stories ++ tickets)
-    |> Enum.reject(&MapSet.member?(exclude_keys, &1.key))
-    |> Enum.take(limit)
+    Enum.map(result.rows, fn [type, key, title, status] ->
+      %{type: type, key: key, title: title, status: status}
+    end)
   end
 
   # --- Helpers ---

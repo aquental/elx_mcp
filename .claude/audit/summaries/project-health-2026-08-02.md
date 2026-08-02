@@ -1,71 +1,113 @@
-# Project Health — ElxMCP — 2026-08-02
+# Project Health Audit — ElxMCP
 
-**Overall score: 82/100 — Grade B**  
-**Suite:** 71 tests green · `mix compile --warnings-as-errors`  
-**Context:** Post `/phx:work` on `.claude/plans/elx-mcp-p1-residual/` (commit `c6e3358` + solutions)
+**Date:** 2026-08-02  
+**Command:** `/phx:audit` (full)  
+**Pulse:** `mix compile --warnings-as-errors` ✓ · `mix test` **78 passed**  
+**Overall:** **79.8 / 100** · **Grade B**
+
+---
 
 ## Executive summary
 
-ElxMCP moved from **76/C → 82/B** after closing the seven residual P1s: Application-owned rate-limit ETS, Path A MCP session binding, Scope-first `project:write` mutations, search fast paths + `pg_trgm`, capped get_* preloads, ID-only resolves for comments/changelog, and deeper MCP resource/429 tests.
+ElxMCP is a **healthy B-grade** Phoenix MCP app: compile/tests green, no Hex advisories, strong app-layer security (API keys, SessionBind, FORCE RLS + SET LOCAL, dual-header auth). Architecture and hot-path performance drag the score: **Collaboration leaks into Projects schemas**, **double `with_tenant`** on every MCP tool, and **search fan-out** (≤9 queries). Residual **ops** risks (public Postgres, etc.) sit outside the app score but dominate real-world blast radius if unremediated (`spec/DB_SEC.md`).
 
-No open **security P1** for tenant isolation or rate-limit table lifetime. Remaining work is structural debt, performance polish, key expiry, and test depth.
+---
 
 ## Category scores
 
-| Category | Score | Grade | Notes |
-|----------|------:|:-----:|-------|
-| Architecture | 76 | C | Scope writes fixed; Projects still multi-aggregate |
-| Performance | 80 | B | Search/preload P1s fixed; multi-query search residual |
-| Security | 89 | B+ | Session bind + authorize_write solid; key expiry P2 |
-| Test quality | 76 | C | 71 tests; tools not_found matrix still thin |
-| Dependencies | 85 | B | hex.audit clean; no mix_audit; unused swoosh/req |
+| Category | Score | Grade | Weight | Weighted |
+|----------|------:|:-----:|-------:|---------:|
+| Architecture | 71 | C | 0.20 | 14.2 |
+| Performance | 77 | C | 0.25 | 19.3 |
+| Security | 88 | B | 0.25 | 22.0 |
+| Tests | 77 | C | 0.15 | 11.6 |
+| Dependencies | 85 | B | 0.15 | 12.8 |
+| **Overall** | **79.8** | **B** | | **79.8** |
 
-**Weighted overall** = 0.20×76 + 0.25×80 + 0.25×89 + 0.15×76 + 0.15×85 ≈ **82 (B)**
+```
+overall = 71×0.20 + 77×0.25 + 88×0.25 + 77×0.15 + 85×0.15 ≈ 79.8
+```
 
-## Critical issues
+---
 
-_None at CRITICAL override level (failing suite, hardcoded secrets, open data IDOR)._
+## Critical / P1 issues (app)
+
+| # | Area | Finding |
+|---|------|---------|
+| 1 | Arch | `Collaboration` queries/mutates `Projects.{Epic,Ticket,UserStory}` via Repo; **bypasses** `Projects.increment_time_spent/3` (dead API) |
+| 2 | Arch | Worklog `belongs_to Ticket` couples contexts; Auth rebuilds `Tenancy.Project` instead of `Tenancy.get_project/1` |
+| 3 | Perf | **Double `with_tenant`**: `Helpers.with_scope` + domain `tenant/2` → extra GUC RTT + savepoints |
+| 4 | Perf | **`search_work_items`** ≤9 sequential `Repo.all`; over-fetch + type-order bias |
+| 5 | Perf | Search residual indexes (description ILIKE; key ILIKE vs btree; trgm ops hygiene) |
+
+**Security app P1:** none.  
+**Deps P1:** none (`hex.audit` clean).
+
+---
 
 ## Top recommendations
 
-### Immediate (optional polish)
+### Immediate (this week)
 
-1. Tool `not_found` coverage for get_* resources already partially covered; extend list tools.
-2. SessionBind TTL unit test + drop legacy 2-tuple support after one release.
-3. Cap attachment mass-assign: stop casting `storage_path` / force uploader from Scope (partially done for email).
+1. Route collab entity checks + time rollup through **Projects** API (`increment_time_spent` callers).
+2. **Single outer tenant** for MCP: drop nested `tenant/2` when already under `with_scope`, or skip GUC when depth>0 without re-set.
+3. Document/trust model: DB credential + GUC `app.bypass_rls` = full data access (RLS is defense-in-depth).
 
-### Short-term (P2)
+### Short-term (2–4 weeks)
 
-1. API key `expires_at` + reject expired in `verify_api_key`.
-2. Trusted proxy / post-auth rate-limit key for multi-tenant prod.
-3. Split `Projects` into boards/sprints vs issues contexts (arch debt).
-4. Collab composite indexes `(project_id, commentable_type, commentable_id)`.
-5. Install `mix_audit` / sobelow for CI hygiene.
+4. Collapse **search** into fewer queries (`UNION ALL` / budget per type).
+5. MCP tool test matrix: **unauthorized + not_found** per tool; collab write `:forbidden` / foreign entity.
+6. CI: add **sobelow** + **mix_audit** (deps.audit) to precommit.
+7. Ops: finish **DB_SEC** open items (network, `pg_hba` aquental) if not done.
 
 ### Long-term
 
-1. Multi-node rate limit + session bind (Redis/Hammer).
-2. Cursor pagination for large lists.
-3. Drop or wire unused `swoosh`/`req` / Component surface.
+8. Split god context **Projects** (Boards / Sprints / WorkItems / Search).
+9. ComponentLink product API or remove orphan surface.
+10. API key `expires_at`; multi-node rate limit if multi-instance.
+
+---
+
+## Cross-cutting themes
+
+| Theme | Categories |
+|-------|------------|
+| Boundary leak + dead API + thin collab tests | Arch + Test |
+| Double tenant GUC cost/risk | Perf + Sec (P3 nested) |
+| God `Projects` hub | Arch + Perf + Test |
+| No sobelow/mix_audit in CI | Sec + Deps |
+| SessionBind legacy 2-tuples | Perf + Sec |
+
+---
 
 ## Action plan
 
 | Horizon | Actions |
 |---------|---------|
-| Now | Ship B-grade baseline; optional compound already written |
-| This sprint | Key expiry, tool not_found tests, collab indexes |
-| Next quarter | Context split, multi-node limiters, sobelow+mix_audit |
+| **Immediate** | Fix collab→Projects API; de-nest `with_tenant` on MCP path |
+| **Short-term** | Search query collapse; tool/collab test matrix; sobelow+mix_audit CI |
+| **Long-term** | Split Projects; ComponentLink API; key expiry; multi-node RL |
 
-## Trend
+---
 
-| Date | Overall | Notes |
-|------|--------:|-------|
-| 2026-08-01 | ~first remediation | Auth email, cycle, hygiene |
-| 2026-08-02 pre-residual | **76/C** | Seven P1 residuals |
-| 2026-08-02 post-residual | **82/B** | This audit |
+## Artifacts
 
-## Compounded knowledge (this wave)
+| Path | Content |
+|------|---------|
+| `.claude/audit/reports/arch-review.md` | Architecture (71) |
+| `.claude/audit/reports/perf-audit.md` | Performance (77) |
+| `.claude/audit/reports/security-audit.md` | Security (88) |
+| `.claude/audit/reports/test-audit.md` | Tests (77) |
+| `.claude/audit/reports/deps-audit.md` | Dependencies (85) |
+| `.claude/audit/summaries/consolidated.md` | Compressed multi-agent digest |
+| `.claude/audit/summaries/project-health-2026-08-02.md` | This report |
 
-- `.claude/solutions/otp-issues/rate-limit-ets-owned-by-request-process-20260802.md`
-- `.claude/solutions/security-issues/mcp-session-bind-path-a-20260802.md`
-- `.claude/solutions/security-issues/scope-first-writes-project-write-20260802.md`
+---
+
+## Pulse checks (this run)
+
+| Check | Result |
+|-------|--------|
+| `mix compile --warnings-as-errors` | Pass |
+| `mix test` | **78 passed** |
+| Critical override (failing tests / compile) | None |

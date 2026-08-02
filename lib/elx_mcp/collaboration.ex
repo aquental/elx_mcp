@@ -3,7 +3,8 @@ defmodule ElxMcp.Collaboration do
   Comments, attachments, worklogs, and changelogs (tenant-scoped).
 
   Writes take `%ElxMcp.Auth.Scope{}` and require `project:write`.
-  Entity ids are verified to belong to `scope.project_id` before insert.
+  Entity ids are verified via `Projects.ensure_entity_in_project/3` (no direct
+  access to Projects schemas). Worklog time rollup uses `Projects.increment_time_spent/3`.
   """
 
   import Ecto.Query
@@ -11,7 +12,7 @@ defmodule ElxMcp.Collaboration do
   alias ElxMcp.Auth
   alias ElxMcp.Auth.Scope
   alias ElxMcp.Collaboration.{Attachment, Changelog, Comment, Worklog}
-  alias ElxMcp.Projects.{Epic, Ticket, UserStory}
+  alias ElxMcp.Projects
   alias ElxMcp.Repo
 
   defp tenant(%Scope{project_id: id}, fun), do: Repo.with_tenant(id, fun)
@@ -21,7 +22,7 @@ defmodule ElxMcp.Collaboration do
       with :ok <- Auth.authorize_write(scope),
            attrs <- Map.new(attrs),
            :ok <-
-             ensure_entity_in_project(
+             Projects.ensure_entity_in_project(
                scope.project_id,
                get_attr(attrs, :commentable_type),
                get_attr(attrs, :commentable_id)
@@ -38,7 +39,7 @@ defmodule ElxMcp.Collaboration do
 
   def list_comments(%Scope{project_id: project_id} = scope, entity_type, entity_id, opts \\ []) do
     tenant(scope, fn ->
-      limit = Keyword.get(opts, :limit, 100) |> min(200)
+      limit = Keyword.get(opts, :limit, 100) |> min(200) |> max(1)
 
       Repo.all(
         from c in Comment,
@@ -56,16 +57,20 @@ defmodule ElxMcp.Collaboration do
       with :ok <- Auth.authorize_write(scope),
            attrs <- Map.new(attrs),
            :ok <-
-             ensure_entity_in_project(
+             Projects.ensure_entity_in_project(
                scope.project_id,
                get_attr(attrs, :attachable_type),
                get_attr(attrs, :attachable_id)
              ) do
+        storage_path =
+          "projects/#{scope.project_id}/attachments/#{Ecto.UUID.generate()}"
+
         %Attachment{}
         |> Attachment.changeset(attrs)
         |> Ecto.Changeset.put_change(:project_id, scope.project_id)
         |> Ecto.Changeset.put_change(:uploaded_by_email, scope.actor_email)
-        |> Ecto.Changeset.validate_required([:project_id])
+        |> Ecto.Changeset.put_change(:storage_path, storage_path)
+        |> Ecto.Changeset.validate_required([:project_id, :storage_path])
         |> Repo.insert()
       end
     end)
@@ -74,7 +79,7 @@ defmodule ElxMcp.Collaboration do
   def create_worklog(%Scope{} = scope, ticket_id, attrs) do
     tenant(scope, fn ->
       with :ok <- Auth.authorize_write(scope),
-           :ok <- ensure_entity_in_project(scope.project_id, "ticket", ticket_id) do
+           :ok <- Projects.ensure_entity_in_project(scope.project_id, "ticket", ticket_id) do
         project_id = scope.project_id
 
         Multi.new()
@@ -88,12 +93,14 @@ defmodule ElxMcp.Collaboration do
           |> Ecto.Changeset.validate_required([:project_id, :ticket_id, :author_email])
         )
         |> Multi.run(:update_ticket, fn _repo, %{worklog: worklog} ->
-          # Already under tenant GUC; avoid nested checkout
-          {count, _} =
-            from(t in Ticket, where: t.id == ^ticket_id and t.project_id == ^project_id)
-            |> Repo.update_all(inc: [time_spent_seconds: worklog.time_spent_seconds])
-
-          if count == 1, do: {:ok, worklog.time_spent_seconds}, else: {:error, :not_found}
+          case Projects.increment_time_spent(
+                 project_id,
+                 ticket_id,
+                 worklog.time_spent_seconds
+               ) do
+            :ok -> {:ok, worklog.time_spent_seconds}
+            {:error, reason} -> {:error, reason}
+          end
         end)
         |> Repo.transaction()
         |> case do
@@ -109,7 +116,7 @@ defmodule ElxMcp.Collaboration do
       with :ok <- Auth.authorize_write(scope),
            attrs <- Map.new(attrs),
            :ok <-
-             ensure_entity_in_project(
+             Projects.ensure_entity_in_project(
                scope.project_id,
                get_attr(attrs, :entity_type),
                get_attr(attrs, :entity_id)
@@ -138,27 +145,6 @@ defmodule ElxMcp.Collaboration do
           limit: ^limit
       )
     end)
-  end
-
-  defp ensure_entity_in_project(_project_id, type, id) when is_nil(type) or is_nil(id),
-    do: {:error, :invalid_association}
-
-  defp ensure_entity_in_project(project_id, "epic", id),
-    do: exists_in_project?(Epic, id, project_id)
-
-  defp ensure_entity_in_project(project_id, "user_story", id),
-    do: exists_in_project?(UserStory, id, project_id)
-
-  defp ensure_entity_in_project(project_id, "ticket", id),
-    do: exists_in_project?(Ticket, id, project_id)
-
-  defp ensure_entity_in_project(_, _, _), do: {:error, :invalid_association}
-
-  defp exists_in_project?(schema, id, project_id) do
-    case Repo.get_by(schema, id: id, project_id: project_id) do
-      nil -> {:error, :invalid_association}
-      _ -> :ok
-    end
   end
 
   defp get_attr(attrs, key) when is_atom(key) do

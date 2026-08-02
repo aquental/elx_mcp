@@ -30,16 +30,13 @@ defmodule ElxMcp.Collaboration.Attachment do
       :attachable_id,
       :filename,
       :content_type,
-      :byte_size,
-      :storage_path,
-      :uploaded_by_email
+      :byte_size
     ])
-    # :project_id set via put_change in context
+    # :project_id, :storage_path, :uploaded_by_email set server-side in Collaboration
     |> validate_required([
       :attachable_type,
       :attachable_id,
-      :filename,
-      :storage_path
+      :filename
     ])
     |> validate_inclusion(:attachable_type, Catalog.linkable_types())
     |> foreign_key_constraint(:project_id)

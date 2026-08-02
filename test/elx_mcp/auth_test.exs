@@ -61,15 +61,17 @@ defmodule ElxMcp.AuthTest do
     hash = :crypto.hash(:sha256, raw)
 
     {:ok, _} =
-      %ElxMcp.Auth.ApiKey{}
-      |> Ecto.Changeset.change(%{
-        project_id: project.id,
-        email: "w@example.com",
-        key_hash: hash,
-        key_prefix: "deadbeef",
-        scopes: ["project:write"]
-      })
-      |> ElxMcp.Repo.insert()
+      ElxMcp.Repo.with_tenant(project.id, fn ->
+        %ElxMcp.Auth.ApiKey{}
+        |> Ecto.Changeset.change(%{
+          project_id: project.id,
+          email: "w@example.com",
+          key_hash: hash,
+          key_prefix: "deadbeef",
+          scopes: ["project:write"]
+        })
+        |> ElxMcp.Repo.insert()
+      end)
 
     assert {:error, :unauthorized} = Auth.verify_api_key(plaintext, "w@example.com")
   end
@@ -77,5 +79,10 @@ defmodule ElxMcp.AuthTest do
   test "rejects invalid scopes at create", %{project: project} do
     assert {:error, :invalid_scopes} =
              Auth.create_api_key(project.id, "a@b.com", %{scopes: ["admin"]})
+  end
+
+  test "rejects empty scopes list", %{project: project} do
+    assert {:error, :invalid_scopes} =
+             Auth.create_api_key(project.id, "a@b.com", %{scopes: []})
   end
 end

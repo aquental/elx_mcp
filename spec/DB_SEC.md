@@ -405,7 +405,7 @@ mix phx.server
 | Role `aquental` | **`NOCREATEROLE`**, senha rotacionada (forte); `CREATEDB` mantido para outros apps; sem CONNECT em `elx_mcp_*` |
 | Backup cifrado | `scripts/db_backup.sh` / `mix db.backup` → `priv/backups/*.dump.gpg`; verify: `mix db.backup.verify` |
 | CIS (v1.6) | `log_lock_waits`, `log_temp_files=10MB`, `log_min_duration_statement=1s`; `CONNECTION LIMIT` roles; extensions `plpgsql`+`pg_trgm` |
-| RLS (v1.6) | FORCE RLS em tabelas tenant; policies `app.project_id` **ou** `app.bypass_rls=on`; `Repo.with_tenant/2`, `Repo.with_bypass/1` |
+| RLS (v1.6–v1.10) | FORCE RLS; policies UUID GUC only (no client bypass GUC); SECDEF owned by `elx_mcp_secdef` (**BYPASSRLS**); `Repo.with_tenant/2` SET LOCAL; see §13.3 |
 
 ### 13.1 Backup e restore (operacional)
 
@@ -425,15 +425,49 @@ mix db.cis_check
 # ou: ./scripts/db_cis_check.sh
 ```
 
-### 13.3 RLS operacional
+### 13.3 RLS operacional (v1.10+)
 
-| GUC | Quem seta | Efeito |
-| --- | --------- | ------ |
-| `app.project_id` | `Repo.with_tenant/2` (contexts + MCP `with_scope`) | Isola linhas do projeto |
-| `app.bypass_rls=on` | `Repo.with_bypass/1` (auth lookup, list projects) | Bypass **somente** via código confiado |
+| Mecanismo | Quem seta | Efeito |
+| --------- | --------- | ------ |
+| `app.project_id` (SET **LOCAL**) | `Repo.with_tenant/2` em `transaction` | Isola linhas; LOCAL termina com COMMIT/ROLLBACK (anti-leak no pool / Sandbox). Process dict limpo no `after` mesmo em erro. |
+| Policies UUID only | `project_id = NULLIF(GUC,'')::uuid` (sem hatch GUC) | Cliente **não** pode ligar bypass via `set_config` |
+| SECURITY DEFINER | Owner `elx_mcp_secdef` com **BYPASSRLS** | Auth/bootstrap (`elx_mcp_lookup_api_key`, `elx_mcp_*project*`, …) sem GUC de bypass; `EXECUTE` só para role da app (`CURRENT_USER` + `elx_mcp_dev`) |
+| Pool hygiene | `Repo.after_connect/1` | `app.project_id=''` em cada conexão nova |
+| Least privilege | Migration `20260802182038` | REVOKE membership (no runtime `SET ROLE`); REVOKE CREATE on `public` from secdef |
 
-`schema_migrations` **sem** RLS. Owner com FORCE RLS; não-superuser **não** pode `SET row_security=off` — por isso o GUC de bypass.
+**Bootstrap de role** (hermes: `elx_mcp_dev` **não** tem `CREATEROLE` — spike 2026-08-02):
 
+```sql
+-- como superuser (postgres), uma vez:
+-- priv/repo/manual/create_elx_mcp_secdef_role.sql
+CREATE ROLE elx_mcp_secdef NOLOGIN NOSUPERUSER NOINHERIT BYPASSRLS;
+GRANT elx_mcp_secdef TO elx_mcp_dev;   -- temporary: only for OWNER TO / grant fixups
+GRANT USAGE, CREATE ON SCHEMA public TO elx_mcp_secdef;  -- CREATE only during migrate
+```
+
+After full migrate chain through `20260802182038_rls_secdef_least_privilege`:
+
+- App is **not** a member of `elx_mcp_secdef` (`pg_has_role(...,'member')` → false) when the migrator is superuser (CI) **or** after the hermes superuser ops SQL below.
+- `elx_mcp_secdef` has USAGE (not CREATE) on schema `public` (CREATE revoke runs as app owner of schema).
+- `EXECUTE` on `elx_mcp_*` is granted to the migrator (`CURRENT_USER`) and `elx_mcp_dev` if different; **not** PUBLIC.
+- Optional multi-role: set app role via env and re-grant EXECUTE after migrate (document as `DB_APP_ROLE` if you introduce a split prod role).
+
+**Hermes superuser residual** (membership was granted by `postgres`; app cannot REVOKE without ADMIN):
+
+```sql
+-- as superuser, once after migrate 182038:
+REVOKE CREATE ON SCHEMA public FROM elx_mcp_secdef;  -- if still present
+REVOKE elx_mcp_secdef FROM elx_mcp_dev;
+```
+
+**Re-own ops** (rare): temporarily `GRANT elx_mcp_secdef TO elx_mcp_dev;`, run ownership/grant SQL, then `REVOKE elx_mcp_secdef FROM elx_mcp_dev;` again.
+
+**Rollback hazard**: **Never** `mix ecto.rollback` past `20260802171043` on shared/prod — `down/0` restores client-settable `app.bypass_rls` in policies. Intermediate `170000`/`170100` can leave PUBLIC EXECUTE if the chain stops mid-way — always migrate fully.
+
+CI (Postgres service com `POSTGRES_USER=elx_mcp_dev` superuser) cria o role na migration automaticamente.
+
+`schema_migrations` **sem** RLS. App **não** expõe bypass genérico. Residual: grants/BYPASSRLS no hermes exigem o SQL manual acima se a migration falhar com “Missing role elx_mcp_secdef”.  
+Testes: `test/elx_mcp/rls_test.exs` (SECDEF isolation hard-fails unless `ELX_MCP_ALLOW_MISSING_SECDEF=1`).
 Revalidar com o checklist do §9 após qualquer mudança de rede/IP.
 
 ---
@@ -451,3 +485,6 @@ Revalidar com o checklist do §9 após qualquer mudança de rede/IP.
 | v1.6 | 2026-08-02 | CIS (limits/logging/check); FORCE RLS + tenant GUC + bypass GUC |
 | v1.7 | 2026-08-02 | CI Option C: GitHub Actions Secrets + Postgres service (`ci.yml`) |
 | v1.8 | 2026-08-02 | `.env.gpg` removido do tracking git (permanece só local + `.gitignore`) |
+| v1.9 | 2026-08-02 | RLS harden: LOCAL GUC clear, UUID policies, SECURITY DEFINER auth |
+| v1.10 | 2026-08-02 | Remove `app.bypass_rls` from policies; SECDEF owner `elx_mcp_secdef` (BYPASSRLS); EXECUTE least-privilege; with_tenant abort hygiene; after_connect GUC |
+| v1.11 | 2026-08-02 | Secdef least privilege (REVOKE membership/CREATE); portable EXECUTE grantee; never-down-past-171043 ops notes; SECDEF test hard-gate |

@@ -272,7 +272,9 @@ repo_common =
   [
     ssl: ssl_opt,
     pool_size: if(config_env() == :test, do: System.schedulers_online() * 2, else: pool_size),
-    socket_options: maybe_ipv6
+    socket_options: maybe_ipv6,
+    # Reset tenant GUC on every new pool connection (W2)
+    after_connect: {ElxMcp.Repo, :after_connect, []}
   ]
 
 config :elx_mcp, ElxMcp.Repo, repo_connection ++ repo_common

@@ -123,6 +123,117 @@ defmodule ElxMcp.ProjectsTest do
     assert Enum.any?(with_desc, &(&1.key == epic.key))
   end
 
+  test "search rank order exact key before prefix before title", %{
+    write_scope: write_scope,
+    scope: scope
+  } do
+    # Query "PRJ-1":
+    # - exact: key PRJ-1 (rank 0)
+    # - prefix: key PRJ-10 (rank 1, ILIKE 'PRJ-1%')
+    # - title: key PRJ-2 with "PRJ-1" only in title (rank 2; key does not match prefix)
+    {:ok, exact} = Projects.create_epic(write_scope, %{title: "Exact holder"})
+    assert exact.key == "PRJ-1"
+
+    {:ok, title_hit} =
+      Projects.create_epic(write_scope, %{title: "Mentions PRJ-1 in title only"})
+
+    assert title_hit.key == "PRJ-2"
+
+    epics =
+      for i <- 3..10 do
+        {:ok, e} = Projects.create_epic(write_scope, %{title: "Epic #{i}"})
+        e
+      end
+
+    prefix_hit = Enum.find(epics, &(&1.key == "PRJ-10"))
+    assert prefix_hit
+
+    results = Projects.search_work_items(scope, "PRJ-1", limit: 50)
+    keys = Enum.map(results, & &1.key)
+
+    exact_idx = Enum.find_index(keys, &(&1 == exact.key))
+    prefix_idx = Enum.find_index(keys, &(&1 == prefix_hit.key))
+    title_idx = Enum.find_index(keys, &(&1 == title_hit.key))
+
+    assert exact_idx == 0
+    assert prefix_idx != nil
+    assert title_idx != nil
+    assert exact_idx < prefix_idx
+    assert prefix_idx < title_idx
+  end
+
+  test "search treats % and _ as literals not wildcards", %{
+    write_scope: write_scope,
+    scope: scope
+  } do
+    {:ok, plain} = Projects.create_epic(write_scope, %{title: "plain title no specials"})
+
+    # Unescaped %/_ would match every title; with ESCAPE they only match literal chars
+    assert [] = Projects.search_work_items(scope, "%")
+    assert [] = Projects.search_work_items(scope, "_")
+
+    assert Enum.any?(
+             Projects.search_work_items(scope, "plain"),
+             &(&1.key == plain.key)
+           )
+
+    {:ok, special} =
+      Projects.create_epic(write_scope, %{title: "100%_complete rare token"})
+
+    hits = Projects.search_work_items(scope, "100%_complete")
+    assert Enum.any?(hits, &(&1.key == special.key))
+  end
+
+  test "search empty or whitespace query returns empty; limit capped", %{
+    write_scope: write_scope,
+    scope: scope
+  } do
+    for i <- 1..5 do
+      {:ok, _} = Projects.create_epic(write_scope, %{title: "Cap #{i}"})
+    end
+
+    assert [] = Projects.search_work_items(scope, "")
+    assert [] = Projects.search_work_items(scope, "   ")
+
+    # limit above hard cap still returns at most 50 (smoke with small set)
+    results = Projects.search_work_items(scope, "Cap", limit: 100)
+    assert length(results) <= 50
+  end
+
+  test "ensure_entity_in_project validation cases", %{
+    write_scope: write_scope,
+    project: project
+  } do
+    {:ok, epic} = Projects.create_epic(write_scope, %{title: "E"})
+    {:ok, story} = Projects.create_user_story(write_scope, %{title: "S", epic_id: epic.id})
+    {:ok, ticket} = Projects.create_ticket(write_scope, %{title: "T", user_story_id: story.id})
+
+    ElxMcp.Repo.with_tenant(project.id, fn ->
+      assert :ok = Projects.ensure_entity_in_project(project.id, "epic", epic.id)
+      assert :ok = Projects.ensure_entity_in_project(project.id, "user_story", story.id)
+      assert :ok = Projects.ensure_entity_in_project(project.id, "ticket", ticket.id)
+
+      assert {:error, :invalid_association} =
+               Projects.ensure_entity_in_project(project.id, nil, epic.id)
+
+      assert {:error, :invalid_association} =
+               Projects.ensure_entity_in_project(project.id, "epic", nil)
+
+      assert {:error, :invalid_association} =
+               Projects.ensure_entity_in_project(project.id, "unknown", epic.id)
+
+      assert {:error, :invalid_association} =
+               Projects.ensure_entity_in_project(project.id, "epic", Ecto.UUID.generate())
+    end)
+
+    {:ok, other} = Tenancy.create_project(%{key: "ENS", name: "Ens"})
+
+    ElxMcp.Repo.with_tenant(other.id, fn ->
+      assert {:error, :invalid_association} =
+               Projects.ensure_entity_in_project(other.id, "epic", epic.id)
+    end)
+  end
+
   test "rejects cross-tenant story association", %{write_scope: write_scope} do
     {:ok, other} = Tenancy.create_project(%{key: "ZZZ", name: "Z"})
 
@@ -173,5 +284,12 @@ defmodule ElxMcp.ProjectsTest do
 
     assert {:ok, id} = Projects.get_ticket_id(scope, ticket.key)
     assert id == ticket.id
+  end
+
+  test "increment_time_spent returns not_found for missing ticket", %{project: project} do
+    missing = Ecto.UUID.generate()
+
+    assert {:error, :not_found} =
+             Projects.increment_time_spent(project.id, missing, 60)
   end
 end
