@@ -49,10 +49,11 @@ if config_env() == :dev do
     live_reload: [
       web_console_logger: true,
       patterns: [
-        ~r"priv/static/(?!uploads/).*\.(js|css|png|jpeg|jpg|gif|svg)$"E,
-        ~r"priv/gettext/.*\.po$"E,
-        ~r"lib/elx_mcp_web/router\.ex$"E,
-        ~r"lib/elx_mcp_web/(controllers|live|components)/.*\.(ex|heex)$"E
+        # No exotic regex options — CI uses Elixir 1.18 (option `E` is not portable)
+        ~r"priv/static/(?!uploads/).*\.(js|css|png|jpeg|jpg|gif|svg)$",
+        ~r"priv/gettext/.*\.po$",
+        ~r"lib/elx_mcp_web/router\.ex$",
+        ~r"lib/elx_mcp_web/(controllers|live|components)/.*\.(ex|heex)$"
       ]
     ]
 end
