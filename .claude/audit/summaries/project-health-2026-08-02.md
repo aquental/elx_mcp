@@ -1,116 +1,71 @@
-# Project Health Audit — ElxMCP
+# Project Health — ElxMCP — 2026-08-02
 
-**Date:** 2026-08-02  
-**Mode:** Full `/phx:audit`  
-**Commit:** `1e92210` (Apply audit remediation) + local uncommitted MCP/config/audit noise  
-**Compared to:** Same-day prior re-audit overall **78 (C)**; original baseline 2026-08-01 **66 (D)**
-
----
+**Overall score: 82/100 — Grade B**  
+**Suite:** 71 tests green · `mix compile --warnings-as-errors`  
+**Context:** Post `/phx:work` on `.claude/plans/elx-mcp-p1-residual/` (commit `c6e3358` + solutions)
 
 ## Executive summary
 
-| Metric | 2026-08-01 | Prior 08-02 | **This audit** |
-|--------|----------:|------------:|---------------:|
-| **Overall score** | 66 | 78 | **76** |
-| **Grade** | D | C | **C** (Needs Attention) |
-| Pulse | — | 45 tests | **45 passed** · compile clean · hex.audit clean · 2 runtime xref cycles |
+ElxMCP moved from **76/C → 82/B** after closing the seven residual P1s: Application-owned rate-limit ETS, Path A MCP session binding, Scope-first `project:write` mutations, search fast paths + `pg_trgm`, capped get_* preloads, ID-only resolves for comments/changelog, and deeper MCP resource/429 tests.
 
-Remediation (dual-header auth, list limits, indexes, Worklog cycle break, prod SSL default, NOTICE) still holds. This pass **re-scored more strictly** on rate-limit ETS ownership (security P1), session binding, ILIKE/preloads, and missing CVE tooling — overall **−2** vs earlier 78, not a regression in shipped code.
-
-**Weighted:**  
-`74×0.20 + 72×0.25 + 80×0.25 + 72×0.15 + 85×0.15` = **76.35 → 76**
-
----
+No open **security P1** for tenant isolation or rate-limit table lifetime. Remaining work is structural debt, performance polish, key expiry, and test depth.
 
 ## Category scores
 
-| Category | 08-01 | Prior 08-02 | **Now** | Δ | Grade |
-|----------|------:|------------:|--------:|--:|-------|
-| Architecture | 67 | 74 | **74** | 0 | C |
-| Performance | 58 | 74 | **72** | −2 | C |
-| Security | 72 | 83 | **80** | −3 | B |
-| Test quality | 60 | 72 | **72** | 0 | C |
-| Dependencies | 72 | 86 | **85** | −1 | B |
+| Category | Score | Grade | Notes |
+|----------|------:|:-----:|-------|
+| Architecture | 76 | C | Scope writes fixed; Projects still multi-aggregate |
+| Performance | 80 | B | Search/preload P1s fixed; multi-query search residual |
+| Security | 89 | B+ | Session bind + authorize_write solid; key expiry P2 |
+| Test quality | 76 | C | 71 tests; tools not_found matrix still thin |
+| Dependencies | 85 | B | hex.audit clean; no mix_audit; unused swoosh/req |
 
----
+**Weighted overall** = 0.20×76 + 0.25×80 + 0.25×89 + 0.15×76 + 0.15×85 ≈ **82 (B)**
 
-## Pulse check
+## Critical issues
 
-| Check | Result |
-|-------|--------|
-| `mix compile --warnings-as-errors` | Pass |
-| `mix test` | **45 passed** (~50s) |
-| `mix hex.audit` | No retired/advisories |
-| `mix hex.outdated` | All top-level Hex deps up-to-date |
-| `mix xref cycles` | **2 runtime** (Phoenix web; Epic↔Story↔Ticket). **0 compile** |
-| `mix deps.audit` / sobelow | Not installed |
+_None at CRITICAL override level (failing suite, hardcoded secrets, open data IDOR)._
 
----
+## Top recommendations
 
-## Top issues (P1, deduped)
+### Immediate (optional polish)
 
-1. **Rate-limit ETS owned by request process** — table deleted when creator exits; counters do not accumulate across connections → abuse protection largely ineffective in prod. Cross: security + perf + test flake risk.
-2. **MCP sessions not bound to `api_key_id` / project** — SSE/DELETE by session id only; tool data still re-authed and tenant-scoped.
-3. **Dual Scope API** — writes take bare `project_id`; `project:write` never enforced (latent until write tools land).
-4. **Search** — leading-`%` ILIKE × 3 tables; no FTS/trgm.
-5. **Unbounded `get_*` preloads** + comments/changelog resolving via full `get_*` for id only.
-6. **Tests** — 4/5 MCP resources untested; tools mostly `isError` smoke; Plug 429 not integration-tested.
+1. Tool `not_found` coverage for get_* resources already partially covered; extend list tools.
+2. SessionBind TTL unit test + drop legacy 2-tuple support after one release.
+3. Cap attachment mass-assign: stop casting `storage_path` / force uploader from Scope (partially done for email).
 
----
+### Short-term (P2)
 
-## Cross-category correlations
+1. API key `expires_at` + reject expired in `verify_api_key`.
+2. Trusted proxy / post-auth rate-limit key for multi-tenant prod.
+3. Split `Projects` into boards/sprints vs issues contexts (arch debt).
+4. Collab composite indexes `(project_id, commentable_type, commentable_id)`.
+5. Install `mix_audit` / sobelow for CI hygiene.
 
-| Root cause | Categories |
-|------------|------------|
-| ETS rate-limit ownership / GC / single-node | Security, Performance, Tests |
-| Dual Scope + cast `:project_id` + unused `project:write` | Architecture, Security |
-| Unbounded get preloads + full encode | Performance, Tests |
-| No `mix_audit` / sobelow in CI | Dependencies, Security |
+### Long-term
 
----
-
-## What’s healthy
-
-- Dual-header auth (X-API-Key + X-Email), SHA-256 keys, email `secure_compare`
-- All MCP tools/resources resolve `%Scope{}` and pin `project_id` on reads
-- No `String.to_atom` / `raw` / interpolated SQL
-- List defaults 50 / max 200; list indexes present; Ticket↔Worklog cycle fixed
-- Prod `DB_SSL` default true; secrets via env; `.env` gitignored
-- Hex audit clean; deps current; Anubis LGPL noted in NOTICE
-
----
+1. Multi-node rate limit + session bind (Redis/Hammer).
+2. Cursor pagination for large lists.
+3. Drop or wire unused `swoosh`/`req` / Component surface.
 
 ## Action plan
 
-### Immediate
-1. Own rate-limit ETS from `Application` (+ prune); verify across two TCP connections  
-2. Bind MCP sessions to key/project (or document risk acceptance)  
-3. Wire comments/changelog to `get_*_id` (+ `get_ticket_id`)  
-4. Add `mix_audit` + `sobelow` (or accept risk)  
-5. Resource tests + MCPAuth 429 integration test after ETS fix  
+| Horizon | Actions |
+|---------|---------|
+| Now | Ship B-grade baseline; optional compound already written |
+| This sprint | Key expiry, tool not_found tests, collab indexes |
+| Next quarter | Context split, multi-node limiters, sobelow+mix_audit |
 
-### Short-term
-6. Scope-first mutations; stop casting `project_id`; enforce `project:write` before any write tools  
-7. Search: key exact/prefix + trgm/FTS  
-8. Cap/paginate `get_*` children; list projections  
-9. API key `expires_at`; deeper tool JSON asserts; factories  
+## Trend
 
-### Long-term
-10. Split `Projects` multi-aggregate; cursor pagination; multi-node rate limit  
-11. Drop unused swoosh/req or productize; LGPL binary pack if shipping releases  
+| Date | Overall | Notes |
+|------|--------:|-------|
+| 2026-08-01 | ~first remediation | Auth email, cycle, hygiene |
+| 2026-08-02 pre-residual | **76/C** | Seven P1 residuals |
+| 2026-08-02 post-residual | **82/B** | This audit |
 
----
+## Compounded knowledge (this wave)
 
-## Artifacts
-
-| File |
-|------|
-| [arch-review.md](../reports/arch-review.md) |
-| [perf-audit.md](../reports/perf-audit.md) |
-| [security-audit.md](../reports/security-audit.md) |
-| [test-audit.md](../reports/test-audit.md) |
-| [deps-audit.md](../reports/deps-audit.md) |
-| [consolidated.md](consolidated.md) |
-| [project-health-2026-08-01.md](project-health-2026-08-01.md) (baseline) |
-
-**Do not compare scores across different projects** — only track trend on ElxMCP.
+- `.claude/solutions/otp-issues/rate-limit-ets-owned-by-request-process-20260802.md`
+- `.claude/solutions/security-issues/mcp-session-bind-path-a-20260802.md`
+- `.claude/solutions/security-issues/scope-first-writes-project-write-20260802.md`

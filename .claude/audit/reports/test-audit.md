@@ -1,106 +1,104 @@
-# Test Health Audit — ElxMCP
+# Test Health Audit: ElxMCP
+
 **Date:** 2026-08-02  
-**Score:** 72 / 100 (grade C)  
-**Baseline:** prior 72/C (same residual gaps; suite still ~45 tests)
+**Scope:** `test/**` (auth, mcp, plugs, projects, collaboration)  
+**Suite run:** not executed (no shell in this reviewer); duration/cover inferred from structure only.
 
-## Summary
-
-| Metric | Value |
-|--------|-------|
-| Test files | **11** (`*_test.exs`) + `test_helper.exs` + 2 support cases |
-| Tests (approx) | **45** |
-| `async: true` | **8** modules |
-| `async: false` | **2** (RateLimit ETS, ValidationMatrix) |
-| Missing async | **1** (`PageControllerTest` — no global state) |
-| Process.sleep / flaky timers | **None** |
-| Mox / `verify_on_exit!` / `defmock` | **None** (not used; no incorrect internal mocks) |
-| Factories | **None** — ad-hoc `Tenancy.create_project` + manual `Scope` in every file |
-| Cover run | Not executed (no shell); estimate from mapping below |
-
-Core domain (Auth email+key, tenancy keys, Projects cycle/isolation, Collaboration isolation) remains solid. Score is still held by shallow MCP tool assertions, **4/5 resources untested**, and missing Plug **429** integration.
-
-## Score breakdown
+## Score: 76 / 100
 
 | Dimension | Max | Score | Notes |
 |-----------|-----|-------|-------|
-| Coverage | 30 | **17** | Contexts ~good; 12/12 tools smoke-only; 1/5 resources; no CORS/E2E `/mcp` |
-| No flakes | 20 | **16** | No sleep; shared ETS `mcp:<ip>` + `MCPAuthTest async: true` residual flake risk |
-| Async | 15 | **13** | 8 true / 2 justified false; `PageControllerTest` omits `async: true` |
-| Mox | 15 | **15** | N/A clean — no boundary mocks required; no illegal DB/stdlib mocks |
-| Duration | 10 | **9** | Small pure unit/DataCase suite; estimated well under 2 min |
-| Error paths | 10 | **6** | Auth/plug 401 strong; tool not-found thin; resource/429/CORS error paths missing |
-| **Total** | **100** | **72** | Unchanged vs prior residual |
+| Coverage of public surface | 30 | 18 | Strong auth/projects/plugs; gaps on components, tenancy helpers, tool not_found matrix, collab write auth |
+| No flaky patterns | 20 | 19 | No `Process.sleep`; ETS correctly `async: false` + reset |
+| Async where possible | 15 | 11 | One missing `async: true`; one unjustified `async: false` |
+| Mox at boundaries | 15 | 15 | N/A (no external I/O mocks) → full |
+| Suite duration | 10 | 7 | ~70 tests, small; unmeasured; mono-test matrix hurts isolation not wall time |
+| Error-path coverage | 10 | 6 | Auth/plugs strong; MCP tools + collab writes thin |
+
+---
+
+## Clean areas (one line each)
+
+- **No `Process.sleep`** anywhere under `test/`.
+- **ETS isolation correct:** `rate_limit_test`, `session_bind_test`, plug session/rate-limit use `async: false` + `reset!`.
+- **Auth context** (`auth_test.exs`): verify/revoke/email/scopes/error paths solid.
+- **Plug auth happy + 401** (`mcp_auth_test.exs`): assigns, header scrub, OPTIONS skip.
+- **Session hijack reject** (`mcp_auth_session_test.exs`): POST/GET/DELETE foreign principal + owner unbind.
+- **Projects tenancy isolation + cycle + association** covered in `projects_test.exs`.
+- **Resources not_found + unauthorized** covered in `resources_test.exs`.
+- **Sandbox** via `DataCase`/`ConnCase` for DB tests.
+- **Mox:** not needed for current pure/DB surface.
+
+---
+
+## Iron Law / structure issues
+
+### Warnings
+
+- [ ] **`page_controller_test.exs:2`** — `use ElxMcpWeb.ConnCase` missing `async: true` (no global state). Fix: `use ElxMcpWeb.ConnCase, async: true`.
+- [ ] **`validation_matrix_test.exs:6`** — `async: false` with no ETS/Application mutation; only Repo sandbox. Prefer `async: true` or justify shared state.
+- [ ] **`validation_matrix_test.exs:13`** — single mega-test V01–V17 reduces failure locality; split per criterion.
+- [ ] **`tools_test.exs:121`** — “list remaining tools” kitchen-sink test; one failure obscures which tool broke. Split per tool.
+
+---
 
 ## Issues found
 
-### P1
-- [ ] **4/5 MCP resources untested** — only `Resources.ProjectStatus.read/2` smoke (`tools_test.exs:117–118`). Untested: `Epic`, `UserStory`, `Ticket`, `Sprint` (`read/2` happy + not_found + unauthorized).
-- [ ] **MCP tool asserts are smoke-only** — 11× `isError == false`, 3× `isError == true`; almost no decoded JSON keys/counts. `get_ticket` uses `text =~ "user_story" or text =~ ticket.title` (title alone always passes).
-- [ ] **Plug 429 path not integration-tested** — `MCPAuth` sends 429 + `retry-after` (`mcp_auth.ex:20–26`); only `RateLimit.check/2` unit tests exist.
+### Critical (coverage / error paths)
 
-### P2
-- [ ] **`ListTickets` happy path missing** — only error on bad `story_key`; no context `list_tickets/2` or successful tool list.
-- [ ] **Projects public API gaps** — `create_component/2`, list filters (`status`/`type`/`assignee`/`limit`), cross-tenant board/sprint/epic/parent guards, LIKE-escape search.
-- [ ] **Auth/Tenancy gaps** — `get_api_key!/1`, `last_used_at` after verify, `list_projects/0`, `get_project_by_key/1`.
-- [ ] **CORS plug untested** — matrix only asserts config is a list (`validation_matrix_test.exs:79–80`).
-- [ ] **Shared ETS rate limiter + async plug tests** — concurrent `MCPAuthTest` keys `mcp:127.0.0.1`; can spuriously 429 under load.
-- [ ] **`PageControllerTest` missing `async: true`**.
-- [ ] **No factories** — repeated setup; drift risk across 6 DataCase files.
-- [ ] **ListComments / ListChangelog** — no invalid `entity_type` / missing key error tests.
-- [ ] **Collaboration error paths** — worklog missing ticket / wrong project; invalid polymorphic types.
+- [ ] **`Projects.create_component/2` untested** (`lib/elx_mcp/projects.ex:97`). Schema + `components`/`component_links` tables asserted in V01 only — no create/list/link behaviour.
+- [ ] **MCP tool `not_found` almost untested.** Only `ListTickets` bad `story_key` (`tools_test.exs:97`). Missing error paths for `GetEpic`, `GetTicket`, `GetUserStory`, `ListComments`, `ListChangelog`, `SearchWorkItems` empty/invalid, `ListUserStories` filter misses.
+- [ ] **Collaboration write-auth incomplete.** `create_comment` has `:forbidden` + foreign id; **no** `:forbidden`/foreign-entity tests for `create_attachment`, `create_worklog`, `record_changelog` (all use same `authorize_write` + `ensure_entity_in_project`).
+- [ ] **`create_worklog` Multi failure path untested** — foreign/missing `ticket_id`, and `increment_time_spent` failure → `{:error, reason}` (`collaboration.ex:67-93`).
+- [ ] **SessionBind invalid args / TTL untested.** No coverage for `{:error, :invalid_session}` (`session_bind.ex:69,90`) or expired-entry `lookup_live` path (`@ttl_ms`).
+- [ ] **Session plug: owner GET success untested.** Only foreign GET 403; no “owner GET with bound session passes”.
+- [ ] **RateLimit window rollover untested.** Counters per bucket; no short `window_ms` test that limit resets after window.
 
-### P3
-- [ ] **`validation_matrix_test.exs`** — one mega-test; V08/V09/V12/V14 are `function_exported?` / doc substrings; V10/V11/V15/V17 skipped silently; duplicates other files; `async: false` without clear need.
-- [ ] **No authenticated full `/mcp` E2E** — success path is plug-unit only (`MCPAuth.call/2`).
-- [ ] **Catalog** — pure allowlists; no dedicated tests (low risk).
-- [ ] **Helpers/telemetry** — `emit_tool` only `function_exported?`, no `:telemetry.attach` assertion.
+### Warnings (assertion strength / duplication)
 
-## Coverage map
+- [ ] **`tools_test.exs:95`** — `assert text =~ "user_story" or text =~ ticket.title` is weak OR; prefer decoded JSON keys (`user_story` field present).
+- [ ] **`tools_test.exs:68-72, 111-119, 121-143`** — many tools only assert `isError == false` without JSON shape/keys (unlike `list_epics`).
+- [ ] **`resources_test.exs:107-114`** — `resource_text/1` falls back to `inspect(other)`; structural regressions can still “pass” if inspect accidentally contains substring.
+- [ ] **`validation_matrix_test.exs:45`** — `assert {:error, _}` swallows changeset vs atom; prefer `errors_on` or `{:error, %Ecto.Changeset{}}`.
+- [ ] **`validation_matrix_test.exs:67-93`** — V08–V14 are `function_exported?` / env smoke checks, not behavioural acceptance.
+- [ ] **`projects_test.exs:98-99`** — `length(...) >= 1` after create is weak; assert created id/name membership.
+- [ ] **`projects_test.exs:162-168`** — “default limit” only creates 3 epics and asserts `<= 50` (tautology); need 51+ or explicit `limit:` opt test.
+- [ ] **Tenancy public API gaps:** no tests for `list_projects/0`, `get_project_by_key/1` (`tenancy.ex:10-17`).
+- [ ] **`get_epic_id` / `get_user_story_id`** used by MCP tools, untested at context layer (only `get_ticket_id`).
+- [ ] **Catalog** (`lib/elx_mcp/catalog.ex`) — zero direct tests for allowlists / `valid_status?` / `valid_priority?`.
+- [ ] **No `mix test --cover` artifact** — cannot verify line coverage of `lib/elx_mcp/**` against claims above; run and attach report on next audit.
 
-### MCP tools (`lib/elx_mcp/mcp/tools/*`) — 12 modules
+### Suggestions
 
-| Tool | Coverage |
-|------|----------|
-| ProjectStatus | Smoke + unauthorized (no assigns / missing `project:read`) |
-| ListEpics | Smoke `isError == false` |
-| GetEpic | Smoke |
-| GetTicket | Smoke + weak content assert |
-| ListTickets | **Error only** (bad `story_key`) — no happy list |
-| ListBoards | Smoke |
-| SearchWorkItems | Smoke |
-| GetUserStory | Smoke (bundled) |
-| ListUserStories | Smoke (bundled) |
-| ListSprints | Smoke (bundled) |
-| ListComments | Smoke (bundled) |
-| ListChangelog | Smoke (bundled) |
+- [ ] Split MCP tools into per-tool modules or `describe` blocks with happy + not_found + unauthorized.
+- [ ] Property or table-driven tests for Catalog allowlists and Auth scope validation.
+- [ ] Add explicit RateLimit test with `window_ms: 50` + `assert_receive`/busy-wait-free clock mock if extractable (or document single-node fixed-window as intentional).
+- [ ] Consider `describe` blocks in `auth_test` / `projects_test` for scanability (not required for quality score).
 
-### MCP resources — 5 modules
+---
 
-| Resource | Coverage |
-|----------|----------|
-| ProjectStatus | Smoke `read/2` + `type == :resource` |
-| Epic / UserStory / Ticket / Sprint | **None** |
+## Per-area checklist
 
-### Contexts
+| Area | Async | Flaky risk | Happy | Error | Notes |
+|------|-------|------------|-------|-------|-------|
+| Auth | ok | low | strong | strong | |
+| RateLimit | `false` ok | low | ok | partial | no window reset |
+| SessionBind | `false` ok | low | ok | partial | no invalid/TTL |
+| MCPAuth plug | ok | low | ok | strong 401 | |
+| Session plug | `false` ok | low | partial | strong 403 | missing owner GET |
+| Rate limit plug | `false` ok | low | n/a | 429 ok | unique IP |
+| Projects | ok | low | good | good | no components |
+| Collaboration | ok | low | ok | partial | write matrix incomplete |
+| MCP tools | ok | low | broad | weak | kitchen-sink + few errors |
+| MCP resources | ok | low | good | good | weak text helper |
+| Tenancy | ok | low | minimal | key only | list/by_key missing |
+| Validation matrix | unjustified `false` | low | smoke | weak | mega-test |
 
-| Context | Coverage |
-|---------|----------|
-| Auth | Strong (create/verify/revoke/scopes/email) |
-| Auth.RateLimit | Unit only (allow + limited); not via Plug |
-| Tenancy | create + issue keys + invalid key; list/by_key missing |
-| Projects | Core CRUD/isolation/cycle/status/search; filters/components thin |
-| Collaboration | comments/changelog/worklog/attachment + isolation; error paths thin |
-| Catalog | Untested (constants) |
+---
 
-### Web
+## Recommended next actions (priority)
 
-| Area | Coverage |
-|------|----------|
-| MCPAuth 401 / success / OPTIONS | Strong |
-| MCPAuth 429 | **Missing** |
-| CORS | **Missing** |
-| Page / ErrorHTML / ErrorJSON | Smoke |
-
-## Clean areas
-
-No `Process.sleep`; SQL Sandbox correct; Auth + tenancy + cycle isolation well tested; RateLimit unit + MCPAuth 401 suite solid; no Mox misuse; 12/12 tools at least invoked once.
+1. Add MCP tool not_found/unauthorized matrix (highest product risk).
+2. Cover `create_component` + collab write `:forbidden`/foreign entity for attachment/worklog/changelog.
+3. Fix `page_controller_test` async; split validation matrix; strengthen weak length/OR asserts.
+4. Run `mix test --cover` and store HTML/console output under `.claude/audit/reports/`.

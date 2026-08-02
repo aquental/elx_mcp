@@ -1,16 +1,10 @@
 # Performance Audit — ElxMCP
 
 **Date:** 2026-08-02  
-**Score:** 72  
-**Grade:** C  
-**Scope:** `lib/elx_mcp/projects.ex`, schemas, `collaboration.ex`, `mcp/` helpers+tools, `auth` rate limit, `priv/repo/migrations/`  
-**Baseline:** 74/C (same residual class; re-scored against current code only)
-
----
-
-## Summary
-
-ElxMCP is an MCP read API over multi-tenant work items. There is **no classic N+1** (`Repo` inside `Enum.map` over query results). List paths have **default/max limits**, tenant-scoped filters, and useful **list indexes**. Residual risk is concentrated in three areas: **leading-wildcard `ILIKE` search across three tables** (no FTS/trgm), **unbounded `has_many` preloads on `get_*`**, and **list tools that only support `limit`** (no offset/cursor) while encoding full schemas. Auth uses an efficient **ETS fixed-window** limiter (single-node, no bucket GC). No heavy LiveViews → streams N/A with partial credit.
+**Score:** 80 / 100  
+**Grade:** B  
+**Scope:** `lib/elx_mcp/projects.ex` (`search_work_items`, `get_*`/`list_*` + `child_limit`), `lib/elx_mcp/collaboration.ex`, `priv/repo/migrations` (indexes, `pg_trgm`), RateLimit / SessionBind ETS prune  
+**Baseline:** Prior audit (72/C) is **stale** — code now has key exact/prefix paths, `pg_trgm` GIN on titles, capped `child_limit` preloads, `get_*_id`, Application-owned ETS + bucket prune.
 
 ---
 
@@ -18,13 +12,13 @@ ElxMCP is an MCP read API over multi-tenant work items. There is **no classic N+
 
 | Category | Max | Score | Notes |
 |----------|-----|-------|--------|
-| N+1 / multi-query | 30 | 25 | No Enum→Repo loops on reads; cycle walk O(depth); status_summary 7 sequential RTTs |
-| Indexes | 20 | 14 | Strong `project_id`+status/updated_at/assignee; no search/trgm; weak collab composites |
-| Preloads | 15 | 6 | Unbounded `:user_stories` / `:tickets` / `:subtasks` on get_*; list resolve still full get_* |
-| GenServer / ETS | 15 | 12 | ETS rate limit is fine; no process bottleneck; no bucket cleanup; sync `last_used` write |
-| LiveView streams | 10 | 8 | N/A (no collection LiveViews); partial credit |
-| SELECT * / payload | 10 | 5 | Search/status slim `select`; lists/get encode full rows (+ assocs) |
-| **Total** | **100** | **72** | |
+| N+1 / multi-query | 30 | 24 | No classic list N+1; search ≤9 RTTs; `status_summary` 7 RTTs; cycle walk O(depth) |
+| Indexes | 20 | 15 | Title trgm + list composites present; description residual; weak collab/sprint/type shapes |
+| Preloads | 15 | 14 | `child_limit` default 50 / max 200; not unbounded |
+| GenServer / ETS | 15 | 12 | RateLimit prune OK; SessionBind foldl + immortal legacy tuples |
+| LiveView streams | 10 | 10 | N/A (no collection LiveViews) → full points |
+| SELECT * / payload | 10 | 5 | Search/status slim; list/get encode full schemas + children |
+| **Total** | **100** | **80** | |
 
 ---
 
@@ -32,89 +26,82 @@ ElxMCP is an MCP read API over multi-tenant work items. There is **no classic N+
 
 ### P1
 
-1. **Leading-`%` ILIKE search × 3 tables (no FTS / trgm)**  
-   - `lib/elx_mcp/projects.ex:246-283` (`search_work_items/3`)  
-   - Caller: `lib/elx_mcp/mcp/tools/search_work_items.ex:21`  
-   - Pattern `"%…%"` on `key | title | description` for epics, stories, tickets → B-tree unusable; text OR forces heap/TOAST reads; three sequential scans; per-table `limit` then `Enum.take` (up to 3× rows, no ranking).  
-   - No `pg_trgm` GIN, no `tsvector`, no exact/prefix key fast path.
+1. **`search_work_items` multi-query fan-out (up to 9 sequential `Repo.all`)**  
+   - `lib/elx_mcp/projects.ex:361-511` (`search_exact_key` ×3, `search_prefix_key` ×3, `search_title` ×3)  
+   - Worst case: three stages always hit three tables even when earlier stages nearly fill `limit`.  
+   - Per-table `limit: ^limit` then `Enum.take(limit)` → up to **3× over-fetch** per stage before merge.  
+   - Type-order merge (`epics ++ stories ++ tickets`) starves tickets when earlier types fill the cap.  
+   - **Fix:** UNION ALL + single `LIMIT`; or stop querying remaining tables once `remaining == 0` *and* short-circuit exact-key hits; allocate remaining budget across types (or rank score).
 
-2. **Unbounded association preloads on `get_*`**  
-   - `get_epic/2` → `Repo.preload(epic, [:user_stories], …)` — `projects.ex:105`  
-   - `get_user_story/2` → `[:tickets, :epic]` — `projects.ex:159`  
-   - `get_ticket/2` → `[:user_story, :subtasks]` — `projects.ex:242`  
-   - MCP tools + resources encode full graph via `Helpers.encode_struct` (`get_epic.ex`, `get_user_story.ex`, `get_ticket.ex`, `mcp/resources/{epic,user_story,ticket}.ex`). Large epics/stories → memory + JSON without child cap.
-
-3. **Comments / changelog resolve still loads full `get_*` (+ preloads) for `.id` only**  
-   - `lib/elx_mcp/mcp/tools/list_comments.ex:39-58`  
-   - `lib/elx_mcp/mcp/tools/list_changelog.ex:40-59`  
-   - Uses `Projects.get_epic` / `get_user_story` / `get_ticket` instead of `get_epic_id` / `get_user_story_id` (and no `get_ticket_id`). Wastes association loads every list call.
+2. **Leading-`%` title ILIKE residual + unindexed description path**  
+   - Title: `%"…"%` uses `pg_trgm` GIN when extension/migration applied (`20260802120000_enable_pg_trgm_search.exs` — `*_title_trgm_idx`).  
+   - **Residual:** `include_description: true` adds `ilike(description, ^pattern)` with **no** trgm/GIN on description → TOAST/seqscan risk (`projects.ex:474-506`). MCP tool currently does not expose the flag (default false) — domain still allows it.  
+   - Prefix key path uses `ilike(key, ^prefix)` (`:444-471`); unique btree on `key` is case-sensitive and often **not** used by `ILIKE` (prefer `like` on uppercased prefix, or `citext`/functional index).  
+   - Extension requires superuser; if `CREATE EXTENSION` fails, title ILIKE degrades to seqscan with no app-level detection.
 
 ### P2
 
-4. **`status_summary/2` — 7 sequential round-trips**  
-   - `lib/elx_mcp/projects.ex:289-354`  
-   - Callers: `mcp/tools/project_status.ex:22`, `mcp/resources/project_status.ex:22`  
-   - 3× `count_by_status` + 3× `recent_rows` + 1× `recent_tickets("in_review")`. Row shapes are slim (`select` maps); bottleneck is RTT fan-out, not payload. No parallelization / single CTE.
+3. **`status_summary/2` — 7 sequential round-trips + 3× recent over-fetch**  
+   - `projects.ex:401-411`, helpers `:525-575`  
+   - 3× `count_by_status` + 3× `recent_rows(limit)` + 1× `recent_tickets("in_review")`.  
+   - `recent_items` loads `limit` from each type then sorts/takes in Elixir (up to 3× rows).  
+   - Callers: `mcp/tools/project_status.ex`, `mcp/resources/project_status.ex`.  
+   - **Fix:** one SQL with FILTER counts + `UNION ALL` recent; or `Task.async_stream` for RTT overlap.
 
-5. **List APIs: limit only — no offset/cursor pagination**  
-   - Domain: `list_epics` `projects.ex:89-97`, `list_user_stories` `:141-151`, `list_tickets` `:223-234`, `list_boards` `:21-29`, `list_sprints` `:42-52`, `list_comments` `collaboration.ex:19-29`, `list_changelog` `:73-84`  
-   - MCP list tools expose `limit` only. Clients cannot page past the first window.
+4. **List / get payloads are full schemas (SELECT *)**  
+   - `list_epics` / `list_user_stories` / `list_tickets` / boards / sprints → full structs; MCP `Helpers.encode_struct/1` ships `description`, estimates, metadata.  
+   - `get_*` loads full parent row + up to `child_limit` full child rows (still heavy at max 200).  
+   - **Fix:** list projection (`key,title,status,priority,updated_at,…`); optional slim get modes.
 
-6. **List payloads are full schemas (SELECT *)**  
-   - MCP list tools → `Helpers.encode_struct/1` on full Ecto structs (e.g. `list_epics.ex:28`, `list_tickets.ex:25`, `list_user_stories.ex:24`).  
-   - No list projection (`key/title/status/priority/updated_at`); includes `description`, `metadata`, labels, estimates.
+5. **No offset/cursor pagination on list APIs**  
+   - Domain + MCP list tools: `limit` only (default 50–100, hard max 200). Clients cannot page past first window.  
+   - `list_comments` MCP schema has **no** `limit` param (`mcp/tools/list_comments.ex:13-16`) — always domain default 100.
 
-7. **`list_changelog` domain limit uncapped**  
-   - `lib/elx_mcp/collaboration.ex:74` — `Keyword.get(opts, :limit, 50)` without `min(..., max)`.  
-   - MCP schema caps at 100 (`list_changelog.ex:15`); direct domain callers can pass arbitrary limit. Contrast `list_comments` (`min(200)` at `collaboration.ex:20`).
+6. **Collaboration list index shapes incomplete**  
+   - Queries filter `project_id + type + id` (+ `order_by inserted_at`):  
+     - `list_comments` `collaboration.ex:36-47`  
+     - `list_changelog` `collaboration.ex:115-126`  
+   - Present: separate `project_id` and `(commentable_type, commentable_id)` / `(entity_type, entity_id)` (`create_project_domain.exs:188-189,244-245`).  
+   - Missing covering composites:  
+     - `(project_id, commentable_type, commentable_id, inserted_at)`  
+     - `(project_id, entity_type, entity_id, inserted_at)`  
+   - Also weak: bare `sprints:status`, bare `tickets:type` vs tenant filters `(project_id, status)` / `(project_id, type)`.
 
-8. **`list_comments` MCP has no limit parameter**  
-   - `lib/elx_mcp/mcp/tools/list_comments.ex:13-16` schema; always domain default 100 / max 200. No tool-level pagination control.
+7. **SessionBind prune cost / immortal legacy entries**  
+   - `lib/elx_mcp/auth/session_bind.ex:125-144` — 1% of `bind_if_new` runs **full-table `:ets.foldl`** + per-key delete (O(n)). Prefer `select_delete` with matchspec on `bound_at`.  
+   - Legacy 2-tuple `{sid, {api_key_id, project_id}}` (`:119-121`) **never expire** and are skipped by prune (no timestamp) → ETS leak if any remain.  
+   - RateLimit (`rate_limit.ex:91-101`) is healthier: Application-owned table + `select_delete` buckets older than 2 windows (1% of checks). Single-node only (documented).
 
-9. **Auth `touch_last_used` on request path**  
-   - `lib/elx_mcp/auth.ex:60`, `119-131`  
-   - 60s debounce + `update_all` by id. Still: sync write when debounce fires; read-then-write race under concurrency; no SQL gate `WHERE last_used_at IS NULL OR last_used_at < ^cutoff`.
-
-10. **Index gaps vs query shapes**  
-    - Present (good): `(project_id, status)` epics/stories/tickets; `(project_id, updated_at)` + assignee composites (`20260802000000_add_list_query_indexes.exs`); FK indexes on epic_id, user_story_id, parent_ticket_id, sprint_id.  
-    - Missing:  
-      - Search: trgm/GIN or FTS on title/description  
-      - Comments: composite `(project_id, commentable_type, commentable_id, inserted_at)` — current `comments:project_id` + `(commentable_type, commentable_id)` (`create_project_domain.exs:188-189`)  
-      - Changelogs: same pattern (`:244-245`)  
-      - Sprints: tenant+status or tenant+`inserted_at` (only bare `sprints:status` at `:53`)  
-      - Tickets type filter: prefer `(project_id, type)` over bare `tickets:type` (`:153`)
-
-11. **Rate limiter ETS: no window GC; setup on every check; single-node**  
-    - `lib/elx_mcp/auth/rate_limit.ex:12-50`  
-    - Atomic `update_counter` is good. Old `{key, bucket}` tuples never deleted → unbounded ETS growth. `setup!()` on every `check/2`. Documented not multi-node-safe. Table created ad-hoc (not under Application supervision).
+8. **Auth `touch_last_used` on hot path**  
+   - `lib/elx_mcp/auth.ex:126-137` — 60s debounce then sync `update_all` by id; read-then-write race; no SQL gate `WHERE last_used_at IS NULL OR last_used_at < ^cutoff`.
 
 ### P3
 
-12. **Parent-cycle walk O(depth) queries**  
-    - `lib/elx_mcp/projects.ex:375-394` — one `Repo.get_by(Ticket, …)` per ancestor hop on create/parent update. Prefer recursive CTE if depth grows.
+9. **Parent-cycle walk O(depth) queries**  
+   - `projects.ex:588-614` — one `Repo.get_by(Ticket, …)` per ancestor on create/parent update. Prefer recursive CTE / single chain select.
 
-13. **`ensure_same_project/3` loads full row for existence**  
-    - `lib/elx_mcp/projects.ex:356-363` — used on create paths. `exists` / `select: true` cheaper under bulk create.
+10. **Existence checks load full rows**  
+    - `ensure_same_project/3` `projects.ex:579-584`; `exists_in_project?/3` `collaboration.ex:142-146` — use `Repo.exists?` / `select: true`.
 
-14. **Search merge bias**  
-    - `projects.ex:283` — `(epics ++ stories ++ tickets) |> Enum.take(limit)` prefers epics then stories; tickets starved when earlier types fill the cap.
+11. **`escape_like/1` without SQL `ESCAPE`**  
+    - `projects.ex:648-653` escapes `\ % _` but Ecto `ilike/2` does not pass `ESCAPE '\'`; residual correctness under wildcards (minor perf noise).
 
 ---
 
-## Clean areas
+## Clean areas (one line each)
 
-- No `Repo.*` inside `Enum.map`/`for` over query results on read paths (encode-only maps).  
-- `list_epics` / `list_user_stories` / `list_tickets` default limit 50, hard max 200 via `maybe_limit/2` (`projects.ex:421-425`).  
-- `get_epic_id` / `get_user_story_id` used by list-filter tools (no preload for epic_key / story_key filters).  
-- `status_summary` recent paths use thin `select` maps (not full structs).  
-- Search domain hard-caps limit at 50; MCP schema max 50.  
-- Indexes: `(project_id, updated_at)`, `(project_id, assignee_email)`, `(project_id, status)` on core work tables.  
-- `list_api_keys/2` limited (`auth.ex:98-107`).  
-- Rate limit uses atomic ETS `update_counter` with `read_concurrency` / `write_concurrency` (not a GenServer bottleneck).  
-- `increment_time_spent` is a single `update_all` (`projects.ex:214-221`).  
-- `next_issue_key` uses `FOR UPDATE` in a transaction (correct, write-path only).  
-- No heavy LiveView collections (MCP-first app).  
-- Tool telemetry duration emission available (`helpers.ex:67-97`) for future latency SLOs.
+- No `Repo` inside `Enum.map` over query results on read paths (no classic N+1).  
+- `get_*` children capped via `child_limit` default 50 / max 200 (`projects.ex:19-20,515-518`).  
+- `get_epic_id` / `get_user_story_id` / `get_ticket_id` used by list filters + comments/changelog resolve.  
+- `list_*` work items default limit 50, hard max 200 (`maybe_limit/2`).  
+- Search hard-caps `min(limit, 50)`; key exact path + optional description opt-in.  
+- Title `pg_trgm` GIN indexes migrated (`epics` / `user_stories` / `tickets`).  
+- List indexes: `(project_id, status)`, `(project_id, updated_at)`, `(project_id, assignee_email)`.  
+- Search / status recent paths use slim `select` maps (not full structs).  
+- RateLimit: Application-owned ETS, atomic `update_counter`, opportunistic `select_delete` prune.  
+- SessionBind: Application-owned ETS, TTL on 3-tuples, refresh-on-activity.  
+- `increment_time_spent` single `update_all`; worklog uses `Ecto.Multi`.  
+- No collection LiveViews (MCP-first) — streams N/A.
 
 ---
 
@@ -122,33 +109,30 @@ ElxMCP is an MCP read API over multi-tenant work items. There is **no classic N+
 
 | # | Sev | Location | Summary |
 |---|-----|----------|---------|
-| 1 | P1 | `projects.ex:246-283` | Leading-% ILIKE ×3; no FTS/trgm |
-| 2 | P1 | `projects.ex:105,159,242` | Unbounded has_many preloads on get_* |
-| 3 | P1 | `list_comments.ex:39-58`, `list_changelog.ex:40-59` | Full get_* to resolve id |
-| 4 | P2 | `projects.ex:289-354` | status_summary 7 sequential queries |
-| 5 | P2 | all `list_*` | No offset/cursor pagination |
-| 6 | P2 | MCP list tools | Full-schema encode |
-| 7 | P2 | `collaboration.ex:74` | list_changelog limit uncapped |
-| 8 | P2 | `list_comments.ex` | No MCP limit param |
-| 9 | P2 | `auth.ex:119-131` | Sync touch_last_used |
-| 10 | P2 | migrations | Collab composites; tenant type/status; search indexes |
-| 11 | P2 | `rate_limit.ex` | No ETS bucket GC; single-node |
-| 12 | P3 | `projects.ex:375-394` | Cycle walk N queries |
-| 13 | P3 | `projects.ex:356-363` | Full-row existence check |
-| 14 | P3 | `projects.ex:283` | Search type-order bias |
+| 1 | P1 | `projects.ex:361-511` | Search ≤9 queries; 3× over-fetch; type merge bias |
+| 2 | P1 | `projects.ex:474-506`, trgm mig | Description ILIKE unindexed; key ILIKE residual; trgm optional |
+| 3 | P2 | `projects.ex:401-575` | status_summary 7 RTTs + recent over-fetch |
+| 4 | P2 | list/get + MCP encode | Full-schema SELECT * / encode |
+| 5 | P2 | list_* APIs | No offset/cursor; list_comments no MCP limit |
+| 6 | P2 | migrations / collab | Missing tenant+polymorphic composites; weak type/status |
+| 7 | P2 | `session_bind.ex` | foldl prune O(n); legacy 2-tuples never expire |
+| 8 | P2 | `auth.ex:126-137` | Sync touch_last_used on request path |
+| 9 | P3 | `projects.ex:588-614` | Cycle walk N queries |
+| 10 | P3 | projects/collaboration | Full-row existence checks |
+| 11 | P3 | `projects.ex:648-653` | LIKE escape without ESCAPE clause |
 
 ---
 
 ## Suggested fix priority (not implemented)
 
-1. Search: key exact/prefix path; FTS or `pg_trgm` GIN on title; optional description; keep hard cap.  
-2. Cap or paginate `get_*` association preloads (or split “detail vs children list”).  
-3. Wire comments/changelog to `get_*_id` (+ add `get_ticket_id`).  
-4. Collapse or parallelize `status_summary` round-trips.  
-5. List projection selects; optional offset/cursor.  
-6. Cap `list_changelog`; expose limit on `list_comments`.  
-7. Collaboration composite indexes; SQL-gated or async `last_used_at`; periodic ETS bucket prune.
+1. Collapse search stages into fewer queries / budget-aware early exit; keep hard cap.  
+2. Confirm `pg_trgm` live in prod; add description trgm only if `include_description` is productized; prefer `like` on uppercased keys for prefix.  
+3. Composite collab indexes; `(project_id, type)` / sprint tenant+status.  
+4. Slim list selects; cursor pagination; expose `limit` on `list_comments`.  
+5. Parallelize or CTE-collapse `status_summary`.  
+6. SessionBind: `select_delete` prune; drop/migrate legacy 2-tuples.  
+7. SQL-gated or async `last_used_at`; `exists?` for association checks.
 
 ---
 
-*End of performance audit. No application code changed.*
+*End of performance audit. Issues only; no application code changed.*
