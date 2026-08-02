@@ -54,7 +54,7 @@ defmodule ElxMcp.ValidationMatrixTest do
     assert byte_size(key.key_hash) == 32
     {:ok, _, _} = Auth.create_api_key(p.id, "v@example.com", %{})
     {:ok, _} = Auth.revoke_api_key(key)
-    assert {:error, :unauthorized} = Auth.verify_api_key(plain)
+    assert {:error, :unauthorized} = Auth.verify_api_key(plain, "v@example.com")
 
     # V08 MCP server module supervised capability
     assert function_exported?(Server, :child_spec, 1)
@@ -80,6 +80,7 @@ defmodule ElxMcp.ValidationMatrixTest do
     assert is_list(Application.get_env(:elx_mcp, :mcp_cors_origins))
 
     # V14 telemetry event name is defined by usage (emit callable)
+    assert Code.ensure_loaded?(ElxMcp.MCP.Helpers)
     assert function_exported?(ElxMcp.MCP.Helpers, :emit_tool, 4)
 
     # V16 isolation already covered in projects_test — quick recheck

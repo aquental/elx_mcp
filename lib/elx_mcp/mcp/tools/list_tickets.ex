@@ -46,8 +46,8 @@ defmodule ElxMcp.MCP.Tools.ListTickets do
         {:ok, opts}
 
       story_key ->
-        case Projects.get_user_story(scope, story_key) do
-          {:ok, story} -> {:ok, Keyword.put(opts, :user_story_id, story.id)}
+        case Projects.get_user_story_id(scope, story_key) do
+          {:ok, id} -> {:ok, Keyword.put(opts, :user_story_id, id)}
           {:error, :not_found} -> {:error, :not_found}
         end
     end

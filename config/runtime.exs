@@ -15,6 +15,7 @@ if File.exists?(env_path) do
     case String.split(line, "=", parts: 2) do
       [key, value] ->
         key = String.trim(key)
+
         value =
           value
           |> String.trim()
@@ -67,12 +68,29 @@ present? = fn key ->
   end
 end
 
+# Prod defaults to verified SSL (true). Dev/test default verify_none for local/self-signed hosts.
+ssl_default = if config_env() == :prod, do: "true", else: "verify_none"
+
 ssl_opt =
-  case System.get_env("DB_SSL", "verify_none") do
-    v when v in ~w(true 1 yes) -> true
-    v when v in ~w(false 0 no) -> false
-    "verify_none" -> [verify: :verify_none]
-    other -> raise "Invalid DB_SSL=#{inspect(other)} (use true|false|verify_none)"
+  case System.get_env("DB_SSL", ssl_default) do
+    v when v in ~w(true 1 yes) ->
+      true
+
+    v when v in ~w(false 0 no) ->
+      false
+
+    "verify_none" ->
+      if config_env() == :prod do
+        IO.warn("""
+        DB_SSL=verify_none in production disables TLS certificate verification (MITM risk).
+        Prefer DB_SSL=true with a trusted CA.
+        """)
+      end
+
+      [verify: :verify_none]
+
+    other ->
+      raise "Invalid DB_SSL=#{inspect(other)} (use true|false|verify_none)"
   end
 
 pool_size = String.to_integer(System.get_env("POOL_SIZE") || "10")

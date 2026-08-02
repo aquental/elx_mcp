@@ -41,14 +41,22 @@ defmodule ElxMcp.Auth do
   end
 
   @doc """
-  Verifies a hex-encoded API key. Returns `{:ok, %Scope{}}` or `{:error, :unauthorized}`.
+  Verifies a hex-encoded API key **and** that it belongs to `email`.
+
+  Email is compared case-insensitively after trim (keys store lowercased email).
+  Returns `{:ok, %Scope{}}` or `{:error, :unauthorized}`.
   """
-  def verify_api_key(plaintext) when is_binary(plaintext) do
-    with true <- valid_hex_key?(plaintext),
+  def verify_api_key(plaintext, email)
+      when is_binary(plaintext) and is_binary(email) do
+    normalized_email = normalize_email(email)
+
+    with true <- normalized_email != "",
+         true <- valid_hex_key?(plaintext),
          {:ok, raw} <- Base.decode16(plaintext, case: :mixed),
          hash <- :crypto.hash(:sha256, raw),
          %ApiKey{} = key <- fetch_active_key(hash),
-         true <- is_list(key.scopes) and "project:read" in key.scopes do
+         true <- is_list(key.scopes) and "project:read" in key.scopes,
+         true <- emails_match?(key.email, normalized_email) do
       touch_last_used(key)
 
       scope = %Scope{
@@ -66,7 +74,18 @@ defmodule ElxMcp.Auth do
     end
   end
 
-  def verify_api_key(_), do: {:error, :unauthorized}
+  def verify_api_key(_, _), do: {:error, :unauthorized}
+
+  defp normalize_email(email) when is_binary(email) do
+    email |> String.trim() |> String.downcase()
+  end
+
+  defp emails_match?(stored, provided)
+       when is_binary(stored) and is_binary(provided) and byte_size(stored) == byte_size(provided) do
+    Plug.Crypto.secure_compare(stored, provided)
+  end
+
+  defp emails_match?(_, _), do: false
 
   def revoke_api_key(%ApiKey{} = key) do
     key
@@ -76,11 +95,14 @@ defmodule ElxMcp.Auth do
 
   def get_api_key!(id), do: Repo.get!(ApiKey, id)
 
-  def list_api_keys(project_id) do
+  def list_api_keys(project_id, opts \\ []) do
+    limit = Keyword.get(opts, :limit, 50) |> min(200)
+
     Repo.all(
       from k in ApiKey,
         where: k.project_id == ^project_id,
-        order_by: [desc: k.inserted_at]
+        order_by: [desc: k.inserted_at],
+        limit: ^limit
     )
   end
 

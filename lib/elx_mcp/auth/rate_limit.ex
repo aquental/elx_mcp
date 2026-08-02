@@ -1,6 +1,8 @@
 defmodule ElxMcp.Auth.RateLimit do
   @moduledoc """
-  Simple ETS sliding-window rate limiter for MCP auth (per IP).
+  Single-node ETS fixed-window rate limiter for MCP auth (per key, typically IP).
+
+  Not multi-node-safe. For multi-node, put a shared limiter (Redis/Hammer) in front.
   """
 
   @table :elx_mcp_rate_limit
@@ -27,29 +29,31 @@ defmodule ElxMcp.Auth.RateLimit do
 
   @doc """
   Returns `:ok` or `{:error, :rate_limited}`.
+
+  Uses an atomic per-window counter (`:ets.update_counter/4`).
   """
   def check(key, opts \\ []) when is_binary(key) do
     setup!()
     limit = Keyword.get(opts, :limit, @default_limit)
     window = Keyword.get(opts, :window_ms, @window_ms)
     now = System.system_time(:millisecond)
-    cutoff = now - window
+    bucket = div(now, window)
+    ets_key = {key, bucket}
 
-    case :ets.lookup(@table, key) do
-      [{^key, times}] ->
-        recent = Enum.filter(times, &(&1 > cutoff))
+    # {ets_key, count} — atomic increment
+    count = :ets.update_counter(@table, ets_key, {2, 1}, {ets_key, 0})
 
-        if length(recent) >= limit do
-          :ets.insert(@table, {key, recent})
-          {:error, :rate_limited}
-        else
-          :ets.insert(@table, {key, [now | recent]})
-          :ok
-        end
-
-      [] ->
-        :ets.insert(@table, {key, [now]})
-        :ok
+    if count > limit do
+      {:error, :rate_limited}
+    else
+      :ok
     end
+  end
+
+  @doc false
+  def reset! do
+    setup!()
+    :ets.delete_all_objects(@table)
+    :ok
   end
 end

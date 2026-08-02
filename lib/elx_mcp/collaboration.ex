@@ -7,7 +7,7 @@ defmodule ElxMcp.Collaboration do
   alias Ecto.Multi
   alias ElxMcp.Auth.Scope
   alias ElxMcp.Collaboration.{Attachment, Changelog, Comment, Worklog}
-  alias ElxMcp.Projects.Ticket
+  alias ElxMcp.Projects
   alias ElxMcp.Repo
 
   def create_comment(project_id, attrs) do
@@ -46,17 +46,16 @@ defmodule ElxMcp.Collaboration do
         |> Map.put(:ticket_id, ticket_id)
       )
     )
-    |> Multi.run(:update_ticket, fn repo, %{worklog: worklog} ->
-      {1, _} =
-        from(t in Ticket, where: t.id == ^ticket_id and t.project_id == ^project_id)
-        |> repo.update_all(inc: [time_spent_seconds: worklog.time_spent_seconds])
-
-      {:ok, worklog.time_spent_seconds}
+    |> Multi.run(:update_ticket, fn _repo, %{worklog: worklog} ->
+      case Projects.increment_time_spent(project_id, ticket_id, worklog.time_spent_seconds) do
+        :ok -> {:ok, worklog.time_spent_seconds}
+        {:error, reason} -> {:error, reason}
+      end
     end)
     |> Repo.transaction()
     |> case do
       {:ok, %{worklog: worklog}} -> {:ok, worklog}
-      {:error, _step, changeset, _} -> {:error, changeset}
+      {:error, _step, reason, _} -> {:error, reason}
     end
   end
 

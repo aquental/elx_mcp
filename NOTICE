@@ -1,0 +1,23 @@
+ElxMCP
+Copyright (c) 2026 ElxMCP contributors
+
+This product includes software developed as part of the ElxMCP project.
+
+------------------------------------------------------------------------------
+Third-party components
+
+anubis_mcp
+  Copyright (c) anubis_mcp authors
+  License: GNU Lesser General Public License v3.0 (LGPL-3.0)
+  Source: https://github.com/zoedsoupe/anubis-mcp
+  Hex: https://hex.pm/packages/anubis_mcp
+
+  ElxMCP links to anubis_mcp at runtime (BEAM) to provide the MCP server
+  transport and protocol implementation. Users may replace this dependency
+  with a compatible implementation under the LGPL terms. The complete
+  corresponding source of anubis_mcp is available via Hex/GitHub as referenced
+  above. A copy of the LGPL-3.0 license text is available at:
+  https://www.gnu.org/licenses/lgpl-3.0.html
+
+Other Hex dependencies (Phoenix, Ecto, Bandit, etc.) are distributed under
+their respective licenses as declared on hex.pm.

@@ -145,7 +145,8 @@ if Auth.list_api_keys(project.id) == [] do
   IO.puts("""
   === Demo API key (dev only — shown once) ===
   X-API-Key: #{plaintext}
-  Project: #{project.key}
+  X-Email:   demo@example.com
+  Project:   #{project.key}
   ===========================================
   """)
 else

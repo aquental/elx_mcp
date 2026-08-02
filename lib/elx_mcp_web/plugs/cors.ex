@@ -16,7 +16,7 @@ defmodule ElxMcpWeb.Plugs.CORS do
       |> put_resp_header("access-control-allow-methods", "GET, POST, DELETE, OPTIONS")
       |> put_resp_header(
         "access-control-allow-headers",
-        "content-type, x-api-key, mcp-session-id, accept"
+        "content-type, x-api-key, x-email, mcp-session-id, accept"
       )
       |> put_resp_header("access-control-max-age", "86400")
 

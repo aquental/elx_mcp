@@ -116,13 +116,16 @@ defmodule ElxMcp.ProjectsTest do
         parent_ticket_id: a.id
       })
 
-    # cycle: a -> b would require updating parent; create C with parent B is ok
-    assert {:ok, _} =
-             Projects.create_ticket(project.id, %{
-               title: "C",
-               type: "subtask",
-               user_story_id: story.id,
-               parent_ticket_id: b.id
-             })
+    # A → parent B would cycle (B already parents under A)
+    assert {:error, :cycle_detected} =
+             Projects.update_ticket_parent(project.id, a.id, b.id)
+  end
+
+  test "list_epics applies default limit", %{project: project, scope: scope} do
+    for i <- 1..3 do
+      assert {:ok, _} = Projects.create_epic(project.id, %{title: "E#{i}"})
+    end
+
+    assert length(Projects.list_epics(scope)) <= 50
   end
 end

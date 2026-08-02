@@ -1,6 +1,8 @@
 defmodule ElxMcpWeb.Plugs.MCPAuth do
   @moduledoc """
-  Authenticates MCP requests via `X-API-Key` header.
+  Authenticates MCP requests via `X-API-Key` and `X-Email` headers.
+
+  Both are required. The API key must belong to the given email.
   """
 
   import Plug.Conn
@@ -29,27 +31,31 @@ defmodule ElxMcpWeb.Plugs.MCPAuth do
   end
 
   defp authenticate(conn) do
-    case get_req_header(conn, "x-api-key") do
-      [key] when is_binary(key) ->
-        case Auth.verify_api_key(String.trim(key)) do
-          {:ok, scope} ->
-            # Do not put plaintext key on assigns; Anubis still receives headers from Plug —
-            # never log frame.context.headers.
-            conn
-            |> assign(:project_id, scope.project_id)
-            |> assign(:api_key_id, scope.api_key_id)
-            |> assign(:api_key_email, scope.actor_email)
-            |> assign(:scopes, scope.scopes)
-            |> assign(:key_prefix, scope.key_prefix)
-            |> assign(:current_scope, scope)
-            |> delete_req_header("x-api-key")
+    api_key = header_value(conn, "x-api-key")
+    email = header_value(conn, "x-email")
 
-          {:error, :unauthorized} ->
-            unauthorized(conn)
-        end
+    case Auth.verify_api_key(api_key, email) do
+      {:ok, scope} ->
+        # Do not put plaintext key on assigns; never log frame.context.headers.
+        conn
+        |> assign(:project_id, scope.project_id)
+        |> assign(:api_key_id, scope.api_key_id)
+        |> assign(:api_key_email, scope.actor_email)
+        |> assign(:scopes, scope.scopes)
+        |> assign(:key_prefix, scope.key_prefix)
+        |> assign(:current_scope, scope)
+        |> delete_req_header("x-api-key")
+        |> delete_req_header("x-email")
 
-      _ ->
+      {:error, :unauthorized} ->
         unauthorized(conn)
+    end
+  end
+
+  defp header_value(conn, name) do
+    case get_req_header(conn, name) do
+      [value] when is_binary(value) -> String.trim(value)
+      _ -> nil
     end
   end
 

@@ -5,7 +5,7 @@ defmodule ElxMcp.MixProject do
     [
       app: :elx_mcp,
       version: "0.1.0",
-      elixir: "~> 1.17",
+      elixir: "~> 1.18",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       aliases: aliases(),
@@ -96,7 +96,13 @@ defmodule ElxMcp.MixProject do
         "esbuild elx_mcp --minify",
         "phx.digest"
       ],
-      precommit: ["compile --warnings-as-errors", "deps.unlock --unused", "format", "test"]
+      precommit: [
+        "compile --warnings-as-errors",
+        "deps.unlock --unused",
+        "format",
+        "cmd mix hex.audit",
+        "test"
+      ]
     ]
   end
 end

@@ -44,8 +44,8 @@ defmodule ElxMcp.MCP.Tools.ListUserStories do
         {:ok, opts}
 
       epic_key ->
-        case Projects.get_epic(scope, epic_key) do
-          {:ok, epic} -> {:ok, Keyword.put(opts, :epic_id, epic.id)}
+        case Projects.get_epic_id(scope, epic_key) do
+          {:ok, id} -> {:ok, Keyword.put(opts, :epic_id, id)}
           {:error, :not_found} -> {:error, :not_found}
         end
     end

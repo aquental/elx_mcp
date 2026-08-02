@@ -31,7 +31,7 @@ defmodule ElxMcp.Projects.Ticket do
     belongs_to :board, Board
     belongs_to :sprint, Sprint
     has_many :subtasks, __MODULE__, foreign_key: :parent_ticket_id
-    has_many :worklogs, ElxMcp.Collaboration.Worklog
+    # No has_many :worklogs — breaks compile cycle Ticket ↔ Worklog
 
     timestamps()
   end
@@ -39,7 +39,6 @@ defmodule ElxMcp.Projects.Ticket do
   def changeset(ticket, attrs) do
     ticket
     |> cast(attrs, [
-      :key,
       :title,
       :description,
       :type,
@@ -52,13 +51,13 @@ defmodule ElxMcp.Projects.Ticket do
       :time_spent_seconds,
       :labels,
       :metadata,
-      :project_id,
       :user_story_id,
       :parent_ticket_id,
       :board_id,
       :sprint_id
     ])
-    |> validate_required([:key, :title, :project_id, :user_story_id])
+    # :key and :project_id set via put_change in context (not mass-assigned)
+    |> validate_required([:title, :user_story_id])
     |> validate_inclusion(:type, Catalog.ticket_types())
     |> validate_inclusion(:status, Catalog.statuses())
     |> validate_inclusion(:priority, Catalog.priorities())

@@ -2,7 +2,7 @@
 
 Servidor **MCP (Model Context Protocol)** em **Phoenix/Elixir** que expõe o **status de projetos** no estilo Jira (épicos, user stories, tickets, sprints, boards, etc.) para clientes de IA (Cursor, Claude Desktop, Grok, etc.).
 
-Os dados ficam no **PostgreSQL** (host configurável via `.env`). Cada cliente autentica-se com uma **API Key** (`X-API-Key`) associada a **um projeto** e a um e-mail. O MCP é **somente leitura** no MVP.
+Os dados ficam no **PostgreSQL** (host configurável via `.env`). Cada cliente autentica-se com **`X-API-Key` + `X-Email`**: a chave deve estar associada ao e-mail informado e a **um projeto**. O MCP é **somente leitura** no MVP.
 
 ## O que este projeto faz
 
@@ -17,9 +17,15 @@ Documentação de produto/técnico: [`spec/SPEC.md`](spec/SPEC.md).
 
 ## Requisitos
 
-- Elixir ~> 1.17
-- PostgreSQL acessível (ver `config/dev.exs` — hostname, user, database)
+- Elixir ~> 1.18 (requerido por `anubis_mcp`)
+- PostgreSQL (credenciais via `.env` — ver secção abaixo)
 - Node (assets / Tailwind, se for usar a UI Phoenix)
+
+### Licenças de dependências
+
+O app ElxMCP é licenciado sob **MIT** (`LICENSE`). O servidor MCP usa
+**`anubis_mcp` (LGPL-3.0)** — ver `NOTICE` para obrigação de aviso e como
+substituir a biblioteca.
 
 ## Setup
 
@@ -68,11 +74,14 @@ mix phx.server
 mix elx_mcp.gen_api_key --project DEMO --email you@example.com --name "Cursor"
 ```
 
-O plaintext da chave aparece **só uma vez** no terminal. Use no header:
+O plaintext da chave aparece **só uma vez** no terminal. Use nos headers:
 
 ```http
 X-API-Key: <64 caracteres hex>
+X-Email: you@example.com
 ```
+
+O e-mail deve ser o mesmo usado na criação da key (`--email`).
 
 ## Como testar
 
@@ -115,15 +124,17 @@ curl -s -X POST http://127.0.0.1:4000/mcp \
 # → {"error":"unauthorized"}
 ```
 
-**Com chave → initialize (200)**
+**Com chave + e-mail → initialize (200)**
 
 ```bash
 export API_KEY="<sua-chave-hex-64>"
+export API_EMAIL="you@example.com"
 
 curl -s -D - -X POST http://127.0.0.1:4000/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -H "X-API-Key: $API_KEY" \
+  -H "X-Email: $API_EMAIL" \
   -d '{
     "jsonrpc": "2.0",
     "id": 1,
@@ -146,6 +157,7 @@ curl -s -X POST http://127.0.0.1:4000/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -H "X-API-Key: $API_KEY" \
+  -H "X-Email: $API_EMAIL" \
   -H "mcp-session-id: <session-id>" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
 ```
@@ -157,17 +169,20 @@ Tools úteis: `project_status`, `list_epics`, `list_user_stories`, `list_tickets
 O ElxMCP **não** usa transporte `stdio`. Ele é um servidor **HTTP Streamable** (protocolo MCP sobre HTTP). O cliente precisa:
 
 1. Saber a **URL** do endpoint  
-2. Enviar a **API Key** em **todo** request no header HTTP `X-API-Key`  
+2. Enviar em **todo** request:  
+   - `X-API-Key` — chave hex de 64 caracteres  
+   - `X-Email` — e-mail dono da key (deve coincidir com o cadastrado)  
 3. Manter o servidor Phoenix no ar (`mix phx.server`)
 
 | Campo | Valor (dev local) |
 |-------|-------------------|
 | URL | `http://127.0.0.1:4000/mcp` (ou `http://localhost:4000/mcp`) |
-| Header obrigatório | `X-API-Key` |
-| Valor do header | a chave hex de 64 caracteres (do seed ou do `mix elx_mcp.gen_api_key`) |
+| Headers obrigatórios | `X-API-Key` + `X-Email` |
+| Valor da key | hex de 64 caracteres (seed ou `mix elx_mcp.gen_api_key`) |
+| Valor do e-mail | o mesmo de `--email` / seed |
 | Nome no protocolo | **ElxMCP Project Status** (v0.2.0) |
 
-> **Importante:** a autenticação é o header `X-API-Key`. Não use query string (`?api_key=`) nem body JSON para a chave. Sem o header (ou com chave inválida/revogada) a resposta é **HTTP 401**.
+> **Importante:** ambos os headers são obrigatórios. A key **deve** estar associada ao e-mail. Sem um deles, com key revogada, ou e-mail diferente do dono da key → **HTTP 401**.
 
 #### Obter a chave antes de cadastrar
 
@@ -194,7 +209,8 @@ Copie a linha `key:` / `X-API-Key:` do output e guarde em local seguro (password
     "elx-mcp": {
       "url": "http://127.0.0.1:4000/mcp",
       "headers": {
-        "X-API-Key": "COLE_AQUI_A_CHAVE_HEX_DE_64_CARACTERES"
+        "X-API-Key": "COLE_AQUI_A_CHAVE_HEX_DE_64_CARACTERES",
+        "X-Email": "you@example.com"
       }
     }
   }
@@ -216,7 +232,8 @@ Muitos clientes ainda documentam só `stdio`. Para HTTP com headers, use a opç�
     "elx-mcp": {
       "url": "http://127.0.0.1:4000/mcp",
       "headers": {
-        "X-API-Key": "COLE_AQUI_A_CHAVE_HEX_DE_64_CARACTERES"
+        "X-API-Key": "COLE_AQUI_A_CHAVE_HEX_DE_64_CARACTERES",
+        "X-Email": "you@example.com"
       }
     }
   }
@@ -238,7 +255,7 @@ Regra geral:
 |------------------|--------|
 | Type / transport | HTTP Streamable (ou “remote MCP”) |
 | Endpoint URL | `http://127.0.0.1:4000/mcp` |
-| Custom headers | `X-API-Key` = `<sua-chave>` |
+| Custom headers | `X-API-Key` + `X-Email` |
 
 Exemplo conceitual (nomes de campos variam por app):
 
@@ -249,16 +266,18 @@ transport: streamable_http   # ou http
 url: http://127.0.0.1:4000/mcp
 headers:
   X-API-Key: "COLE_AQUI_A_CHAVE_HEX_DE_64_CARACTERES"
+  X-Email: "you@example.com"
 ```
 
 #### Checklist se a conexão falhar
 
 1. `mix phx.server` está rodando e [http://localhost:4000](http://localhost:4000) responde?  
 2. A URL termina em **`/mcp`** (não só `/`)?  
-3. O header se chama exatamente **`X-API-Key`** (case-insensitive no HTTP, mas o valor da chave deve ser o hex completo)?  
-4. A chave tem **64** caracteres hex e não foi revogada?  
-5. Teste com curl (secção 2): se o curl der 401, o problema é a key/servidor, não o cliente.  
-6. Em produção/remoto: use HTTPS e coloque a origem do browser em `MCP_CORS_ORIGINS` se o cliente for web.
+3. Os headers **`X-API-Key`** e **`X-Email`** estão presentes em toda request?  
+4. O e-mail é o **mesmo** associado à key (case-insensitive)?  
+5. A chave tem **64** caracteres hex e não foi revogada?  
+6. Teste com curl (secção 2): se o curl der 401, o problema é key/e-mail/servidor, não o cliente.  
+7. Em produção/remoto: use HTTPS e coloque a origem do browser em `MCP_CORS_ORIGINS` se o cliente for web.
 
 #### Uma key = um projeto
 
@@ -268,7 +287,7 @@ Cada API Key enxerga **apenas o projeto** ao qual foi ligada (`--project DEMO`).
 mix elx_mcp.gen_api_key --project OUTRO --email you@example.com --name "Cursor Outro"
 ```
 
-Cadastre no cliente um segundo servidor MCP (outro bloco `mcpServers`) com a URL igual e o `X-API-Key` da key desse projeto.
+Cadastre no cliente um segundo servidor MCP (outro bloco `mcpServers`) com a URL igual e os headers `X-API-Key` + `X-Email` dessa key.
 
 ### 4. Dados de demo (após seeds)
 
@@ -336,7 +355,7 @@ lib/elx_mcp/
   auth/             # API keys, Scope, rate limit
   mcp/              # Anubis server, tools, resources
 lib/elx_mcp_web/plugs/
-  mcp_auth.ex       # X-API-Key
+  mcp_auth.ex       # X-API-Key + X-Email
   cors.ex
 spec/SPEC.md        # especificação do produto
 ```
