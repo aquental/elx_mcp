@@ -233,7 +233,8 @@ defmodule ElxMcp.Projects do
     end)
   end
 
-  def get_user_story(%Scope{project_id: project_id} = scope, key, opts \\ []) when is_binary(key) do
+  def get_user_story(%Scope{project_id: project_id} = scope, key, opts \\ [])
+      when is_binary(key) do
     tenant(scope, fn ->
       case Repo.one(from s in UserStory, where: s.project_id == ^project_id and s.key == ^key) do
         nil ->
@@ -241,7 +242,9 @@ defmodule ElxMcp.Projects do
 
         story ->
           n = child_limit(opts)
-          epic = if story.epic_id, do: Repo.get_by(Epic, id: story.epic_id, project_id: project_id)
+
+          epic =
+            if story.epic_id, do: Repo.get_by(Epic, id: story.epic_id, project_id: project_id)
 
           tickets =
             from(t in Ticket,
@@ -402,7 +405,8 @@ defmodule ElxMcp.Projects do
 
   Hard cap `min(limit, 50)`.
   """
-  def search_work_items(%Scope{project_id: project_id} = scope, q, opts \\ []) when is_binary(q) do
+  def search_work_items(%Scope{project_id: project_id} = scope, q, opts \\ [])
+      when is_binary(q) do
     tenant(scope, fn ->
       q = String.trim(q)
       limit = Keyword.get(opts, :limit, 25) |> min(50)
@@ -421,7 +425,12 @@ defmodule ElxMcp.Projects do
 
         prefix_hits =
           if remaining > 0 do
-            search_prefix_key(project_id, prefix, remaining, MapSet.new(Enum.map(exact, & &1.key)))
+            search_prefix_key(
+              project_id,
+              prefix,
+              remaining,
+              MapSet.new(Enum.map(exact, & &1.key))
+            )
           else
             []
           end
