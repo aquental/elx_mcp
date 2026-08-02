@@ -45,7 +45,8 @@ defmodule ElxMcp.MCP.Helpers do
   def with_scope(frame, fun) do
     case scope_from_frame(frame) do
       %Scope{} = scope ->
-        fun.(scope)
+        # Pin pool connection + app.project_id for PostgreSQL RLS
+        ElxMcp.Repo.with_tenant(scope.project_id, fn -> fun.(scope) end)
 
       nil ->
         log_tool("?", nil, nil, %{}, :unauthorized, 0)

@@ -102,7 +102,10 @@ defmodule ElxMcp.MixProject do
         "format",
         "cmd mix hex.audit",
         "test"
-      ]
+      ],
+      "db.backup": ["cmd bash scripts/db_backup.sh"],
+      "db.backup.verify": ["cmd bash scripts/db_restore_verify.sh"],
+      "db.cis_check": ["cmd bash scripts/db_cis_check.sh"]
     ]
   end
 end

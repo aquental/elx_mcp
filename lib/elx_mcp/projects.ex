@@ -19,12 +19,18 @@ defmodule ElxMcp.Projects do
   @default_child_limit 50
   @max_child_limit 200
 
+  defp tenant(%Scope{project_id: id}, fun), do: Repo.with_tenant(id, fun)
+
+  defp tenant(project_id, fun) when is_binary(project_id), do: Repo.with_tenant(project_id, fun)
+
   # --- Boards / Sprints / Components ---
 
   def create_board(%Scope{} = scope, attrs) do
-    with :ok <- Auth.authorize_write(scope) do
-      do_create_board(scope.project_id, attrs)
-    end
+    tenant(scope, fn ->
+      with :ok <- Auth.authorize_write(scope) do
+        do_create_board(scope.project_id, attrs)
+      end
+    end)
   end
 
   defp do_create_board(project_id, attrs) do
@@ -35,21 +41,25 @@ defmodule ElxMcp.Projects do
     |> Repo.insert()
   end
 
-  def list_boards(%Scope{project_id: project_id}, opts \\ []) do
-    limit = Keyword.get(opts, :limit, 100) |> min(200)
+  def list_boards(%Scope{project_id: project_id} = scope, opts \\ []) do
+    tenant(scope, fn ->
+      limit = Keyword.get(opts, :limit, 100) |> min(200)
 
-    Repo.all(
-      from b in Board,
-        where: b.project_id == ^project_id,
-        order_by: [asc: b.name],
-        limit: ^limit
-    )
+      Repo.all(
+        from b in Board,
+          where: b.project_id == ^project_id,
+          order_by: [asc: b.name],
+          limit: ^limit
+      )
+    end)
   end
 
   def create_sprint(%Scope{} = scope, attrs) do
-    with :ok <- Auth.authorize_write(scope) do
-      do_create_sprint(scope.project_id, attrs)
-    end
+    tenant(scope, fn ->
+      with :ok <- Auth.authorize_write(scope) do
+        do_create_sprint(scope.project_id, attrs)
+      end
+    end)
   end
 
   defp do_create_sprint(project_id, attrs) do
@@ -69,35 +79,41 @@ defmodule ElxMcp.Projects do
     end
   end
 
-  def list_sprints(%Scope{project_id: project_id}, opts \\ []) do
-    status = Keyword.get(opts, :status)
-    limit = Keyword.get(opts, :limit, 100) |> min(200)
+  def list_sprints(%Scope{project_id: project_id} = scope, opts \\ []) do
+    tenant(scope, fn ->
+      status = Keyword.get(opts, :status)
+      limit = Keyword.get(opts, :limit, 100) |> min(200)
 
-    Sprint
-    |> where([s], s.project_id == ^project_id)
-    |> maybe_filter_status(status)
-    |> order_by([s], desc: s.inserted_at)
-    |> limit(^limit)
-    |> Repo.all()
+      Sprint
+      |> where([s], s.project_id == ^project_id)
+      |> maybe_filter_status(status)
+      |> order_by([s], desc: s.inserted_at)
+      |> limit(^limit)
+      |> Repo.all()
+    end)
   end
 
-  def get_sprint(%Scope{project_id: project_id}, id_or_name) when is_binary(id_or_name) do
-    query =
-      case Ecto.UUID.cast(id_or_name) do
-        {:ok, id} -> from s in Sprint, where: s.project_id == ^project_id and s.id == ^id
-        :error -> from s in Sprint, where: s.project_id == ^project_id and s.name == ^id_or_name
-      end
+  def get_sprint(%Scope{project_id: project_id} = scope, id_or_name) when is_binary(id_or_name) do
+    tenant(scope, fn ->
+      query =
+        case Ecto.UUID.cast(id_or_name) do
+          {:ok, id} -> from s in Sprint, where: s.project_id == ^project_id and s.id == ^id
+          :error -> from s in Sprint, where: s.project_id == ^project_id and s.name == ^id_or_name
+        end
 
-    case Repo.one(query) do
-      nil -> {:error, :not_found}
-      sprint -> {:ok, sprint}
-    end
+      case Repo.one(query) do
+        nil -> {:error, :not_found}
+        sprint -> {:ok, sprint}
+      end
+    end)
   end
 
   def create_component(%Scope{} = scope, attrs) do
-    with :ok <- Auth.authorize_write(scope) do
-      do_create_component(scope.project_id, attrs)
-    end
+    tenant(scope, fn ->
+      with :ok <- Auth.authorize_write(scope) do
+        do_create_component(scope.project_id, attrs)
+      end
+    end)
   end
 
   defp do_create_component(project_id, attrs) do
@@ -111,9 +127,11 @@ defmodule ElxMcp.Projects do
   # --- Epics ---
 
   def create_epic(%Scope{} = scope, attrs) do
-    with :ok <- Auth.authorize_write(scope) do
-      do_create_epic(scope.project_id, attrs)
-    end
+    tenant(scope, fn ->
+      with :ok <- Auth.authorize_write(scope) do
+        do_create_epic(scope.project_id, attrs)
+      end
+    end)
   end
 
   defp do_create_epic(project_id, attrs) do
@@ -127,54 +145,62 @@ defmodule ElxMcp.Projects do
     end
   end
 
-  def list_epics(%Scope{project_id: project_id}, opts \\ []) do
-    Epic
-    |> where([e], e.project_id == ^project_id)
-    |> maybe_filter_status(Keyword.get(opts, :status))
-    |> maybe_filter_priority(Keyword.get(opts, :priority))
-    |> order_by([e], desc: e.updated_at)
-    |> maybe_limit(Keyword.get(opts, :limit, 50))
-    |> Repo.all()
+  def list_epics(%Scope{project_id: project_id} = scope, opts \\ []) do
+    tenant(scope, fn ->
+      Epic
+      |> where([e], e.project_id == ^project_id)
+      |> maybe_filter_status(Keyword.get(opts, :status))
+      |> maybe_filter_priority(Keyword.get(opts, :priority))
+      |> order_by([e], desc: e.updated_at)
+      |> maybe_limit(Keyword.get(opts, :limit, 50))
+      |> Repo.all()
+    end)
   end
 
-  def get_epic(%Scope{project_id: project_id}, key, opts \\ []) when is_binary(key) do
-    case Repo.one(from e in Epic, where: e.project_id == ^project_id and e.key == ^key) do
-      nil ->
-        {:error, :not_found}
+  def get_epic(%Scope{project_id: project_id} = scope, key, opts \\ []) when is_binary(key) do
+    tenant(scope, fn ->
+      case Repo.one(from e in Epic, where: e.project_id == ^project_id and e.key == ^key) do
+        nil ->
+          {:error, :not_found}
 
-      epic ->
-        n = child_limit(opts)
+        epic ->
+          n = child_limit(opts)
 
-        stories =
-          from(us in UserStory,
-            where: us.epic_id == ^epic.id and us.project_id == ^project_id,
-            order_by: [desc: us.updated_at],
-            limit: ^n
-          )
-          |> Repo.all()
+          stories =
+            from(us in UserStory,
+              where: us.epic_id == ^epic.id and us.project_id == ^project_id,
+              order_by: [desc: us.updated_at],
+              limit: ^n
+            )
+            |> Repo.all()
 
-        {:ok, %{epic | user_stories: stories}}
-    end
+          {:ok, %{epic | user_stories: stories}}
+      end
+    end)
   end
 
   @doc "Resolve epic id by key without preloads (for list filters)."
-  def get_epic_id(%Scope{project_id: project_id}, key) when is_binary(key) do
-    case Repo.one(
-           from e in Epic,
-             where: e.project_id == ^project_id and e.key == ^key,
-             select: e.id
-         ) do
-      nil -> {:error, :not_found}
-      id -> {:ok, id}
-    end
+  def get_epic_id(%Scope{project_id: project_id} = scope, key) when is_binary(key) do
+    tenant(scope, fn ->
+      case Repo.one(
+             from e in Epic,
+               where: e.project_id == ^project_id and e.key == ^key,
+               select: e.id
+           ) do
+        nil -> {:error, :not_found}
+        id -> {:ok, id}
+      end
+    end)
   end
 
   # --- User stories ---
 
   def create_user_story(%Scope{} = scope, attrs) do
-    with :ok <- Auth.authorize_write(scope) do
-      do_create_user_story(scope.project_id, attrs)
-    end
+    tenant(scope, fn ->
+      with :ok <- Auth.authorize_write(scope) do
+        do_create_user_story(scope.project_id, attrs)
+      end
+    end)
   end
 
   defp do_create_user_story(project_id, attrs) do
@@ -193,57 +219,65 @@ defmodule ElxMcp.Projects do
     end
   end
 
-  def list_user_stories(%Scope{project_id: project_id}, opts \\ []) do
-    UserStory
-    |> where([s], s.project_id == ^project_id)
-    |> maybe_filter_status(Keyword.get(opts, :status))
-    |> maybe_filter_epic_id(Keyword.get(opts, :epic_id))
-    |> maybe_filter_sprint_id(Keyword.get(opts, :sprint_id))
-    |> maybe_filter_assignee(Keyword.get(opts, :assignee_email))
-    |> order_by([s], desc: s.updated_at)
-    |> maybe_limit(Keyword.get(opts, :limit, 50))
-    |> Repo.all()
+  def list_user_stories(%Scope{project_id: project_id} = scope, opts \\ []) do
+    tenant(scope, fn ->
+      UserStory
+      |> where([s], s.project_id == ^project_id)
+      |> maybe_filter_status(Keyword.get(opts, :status))
+      |> maybe_filter_epic_id(Keyword.get(opts, :epic_id))
+      |> maybe_filter_sprint_id(Keyword.get(opts, :sprint_id))
+      |> maybe_filter_assignee(Keyword.get(opts, :assignee_email))
+      |> order_by([s], desc: s.updated_at)
+      |> maybe_limit(Keyword.get(opts, :limit, 50))
+      |> Repo.all()
+    end)
   end
 
-  def get_user_story(%Scope{project_id: project_id}, key, opts \\ []) when is_binary(key) do
-    case Repo.one(from s in UserStory, where: s.project_id == ^project_id and s.key == ^key) do
-      nil ->
-        {:error, :not_found}
+  def get_user_story(%Scope{project_id: project_id} = scope, key, opts \\ []) when is_binary(key) do
+    tenant(scope, fn ->
+      case Repo.one(from s in UserStory, where: s.project_id == ^project_id and s.key == ^key) do
+        nil ->
+          {:error, :not_found}
 
-      story ->
-        n = child_limit(opts)
-        epic = if story.epic_id, do: Repo.get_by(Epic, id: story.epic_id, project_id: project_id)
+        story ->
+          n = child_limit(opts)
+          epic = if story.epic_id, do: Repo.get_by(Epic, id: story.epic_id, project_id: project_id)
 
-        tickets =
-          from(t in Ticket,
-            where: t.user_story_id == ^story.id and t.project_id == ^project_id,
-            order_by: [desc: t.updated_at],
-            limit: ^n
-          )
-          |> Repo.all()
+          tickets =
+            from(t in Ticket,
+              where: t.user_story_id == ^story.id and t.project_id == ^project_id,
+              order_by: [desc: t.updated_at],
+              limit: ^n
+            )
+            |> Repo.all()
 
-        {:ok, %{story | epic: epic, tickets: tickets}}
-    end
+          {:ok, %{story | epic: epic, tickets: tickets}}
+      end
+    end)
   end
 
   @doc "Resolve user story id by key without preloads."
-  def get_user_story_id(%Scope{project_id: project_id}, key) when is_binary(key) do
-    case Repo.one(
-           from s in UserStory,
-             where: s.project_id == ^project_id and s.key == ^key,
-             select: s.id
-         ) do
-      nil -> {:error, :not_found}
-      id -> {:ok, id}
-    end
+  def get_user_story_id(%Scope{project_id: project_id} = scope, key) when is_binary(key) do
+    tenant(scope, fn ->
+      case Repo.one(
+             from s in UserStory,
+               where: s.project_id == ^project_id and s.key == ^key,
+               select: s.id
+           ) do
+        nil -> {:error, :not_found}
+        id -> {:ok, id}
+      end
+    end)
   end
 
   # --- Tickets ---
 
   def create_ticket(%Scope{} = scope, attrs) do
-    with :ok <- Auth.authorize_write(scope) do
-      do_create_ticket(scope.project_id, attrs)
-    end
+    tenant(scope, fn ->
+      with :ok <- Auth.authorize_write(scope) do
+        do_create_ticket(scope.project_id, attrs)
+      end
+    end)
   end
 
   defp do_create_ticket(project_id, attrs) do
@@ -269,9 +303,11 @@ defmodule ElxMcp.Projects do
   Requires `project:write`.
   """
   def update_ticket_parent(%Scope{} = scope, ticket_id, parent_ticket_id) do
-    with :ok <- Auth.authorize_write(scope) do
-      do_update_ticket_parent(scope.project_id, ticket_id, parent_ticket_id)
-    end
+    tenant(scope, fn ->
+      with :ok <- Auth.authorize_write(scope) do
+        do_update_ticket_parent(scope.project_id, ticket_id, parent_ticket_id)
+      end
+    end)
   end
 
   defp do_update_ticket_parent(project_id, ticket_id, parent_ticket_id) do
@@ -292,60 +328,68 @@ defmodule ElxMcp.Projects do
   @doc "Atomically increment ticket time_spent_seconds (used by worklogs)."
   def increment_time_spent(project_id, ticket_id, seconds)
       when is_integer(seconds) and seconds > 0 do
-    {count, _} =
-      from(t in Ticket, where: t.id == ^ticket_id and t.project_id == ^project_id)
-      |> Repo.update_all(inc: [time_spent_seconds: seconds])
+    tenant(project_id, fn ->
+      {count, _} =
+        from(t in Ticket, where: t.id == ^ticket_id and t.project_id == ^project_id)
+        |> Repo.update_all(inc: [time_spent_seconds: seconds])
 
-    if count == 1, do: :ok, else: {:error, :not_found}
+      if count == 1, do: :ok, else: {:error, :not_found}
+    end)
   end
 
-  def list_tickets(%Scope{project_id: project_id}, opts \\ []) do
-    Ticket
-    |> where([t], t.project_id == ^project_id)
-    |> maybe_filter_status(Keyword.get(opts, :status))
-    |> maybe_filter_type(Keyword.get(opts, :type))
-    |> maybe_filter_story_id(Keyword.get(opts, :user_story_id))
-    |> maybe_filter_sprint_id(Keyword.get(opts, :sprint_id))
-    |> maybe_filter_assignee(Keyword.get(opts, :assignee_email))
-    |> order_by([t], desc: t.updated_at)
-    |> maybe_limit(Keyword.get(opts, :limit, 50))
-    |> Repo.all()
+  def list_tickets(%Scope{project_id: project_id} = scope, opts \\ []) do
+    tenant(scope, fn ->
+      Ticket
+      |> where([t], t.project_id == ^project_id)
+      |> maybe_filter_status(Keyword.get(opts, :status))
+      |> maybe_filter_type(Keyword.get(opts, :type))
+      |> maybe_filter_story_id(Keyword.get(opts, :user_story_id))
+      |> maybe_filter_sprint_id(Keyword.get(opts, :sprint_id))
+      |> maybe_filter_assignee(Keyword.get(opts, :assignee_email))
+      |> order_by([t], desc: t.updated_at)
+      |> maybe_limit(Keyword.get(opts, :limit, 50))
+      |> Repo.all()
+    end)
   end
 
-  def get_ticket(%Scope{project_id: project_id}, key, opts \\ []) when is_binary(key) do
-    case Repo.one(from t in Ticket, where: t.project_id == ^project_id and t.key == ^key) do
-      nil ->
-        {:error, :not_found}
+  def get_ticket(%Scope{project_id: project_id} = scope, key, opts \\ []) when is_binary(key) do
+    tenant(scope, fn ->
+      case Repo.one(from t in Ticket, where: t.project_id == ^project_id and t.key == ^key) do
+        nil ->
+          {:error, :not_found}
 
-      ticket ->
-        n = child_limit(opts)
+        ticket ->
+          n = child_limit(opts)
 
-        story =
-          if ticket.user_story_id,
-            do: Repo.get_by(UserStory, id: ticket.user_story_id, project_id: project_id)
+          story =
+            if ticket.user_story_id,
+              do: Repo.get_by(UserStory, id: ticket.user_story_id, project_id: project_id)
 
-        subtasks =
-          from(t in Ticket,
-            where: t.parent_ticket_id == ^ticket.id and t.project_id == ^project_id,
-            order_by: [desc: t.updated_at],
-            limit: ^n
-          )
-          |> Repo.all()
+          subtasks =
+            from(t in Ticket,
+              where: t.parent_ticket_id == ^ticket.id and t.project_id == ^project_id,
+              order_by: [desc: t.updated_at],
+              limit: ^n
+            )
+            |> Repo.all()
 
-        {:ok, %{ticket | user_story: story, subtasks: subtasks}}
-    end
+          {:ok, %{ticket | user_story: story, subtasks: subtasks}}
+      end
+    end)
   end
 
   @doc "Resolve ticket id by key without preloads."
-  def get_ticket_id(%Scope{project_id: project_id}, key) when is_binary(key) do
-    case Repo.one(
-           from t in Ticket,
-             where: t.project_id == ^project_id and t.key == ^key,
-             select: t.id
-         ) do
-      nil -> {:error, :not_found}
-      id -> {:ok, id}
-    end
+  def get_ticket_id(%Scope{project_id: project_id} = scope, key) when is_binary(key) do
+    tenant(scope, fn ->
+      case Repo.one(
+             from t in Ticket,
+               where: t.project_id == ^project_id and t.key == ^key,
+               select: t.id
+           ) do
+        nil -> {:error, :not_found}
+        id -> {:ok, id}
+      end
+    end)
   end
 
   @doc """
@@ -358,57 +402,61 @@ defmodule ElxMcp.Projects do
 
   Hard cap `min(limit, 50)`.
   """
-  def search_work_items(%Scope{project_id: project_id}, q, opts \\ []) when is_binary(q) do
-    q = String.trim(q)
-    limit = Keyword.get(opts, :limit, 25) |> min(50)
-    include_desc? = Keyword.get(opts, :include_description, false)
+  def search_work_items(%Scope{project_id: project_id} = scope, q, opts \\ []) when is_binary(q) do
+    tenant(scope, fn ->
+      q = String.trim(q)
+      limit = Keyword.get(opts, :limit, 25) |> min(50)
+      include_desc? = Keyword.get(opts, :include_description, false)
 
-    if q == "" do
-      []
-    else
-      escaped = escape_like(q)
-      exact_key = String.upcase(q)
-      prefix = escaped <> "%"
-      title_pattern = "%" <> escaped <> "%"
+      if q == "" do
+        []
+      else
+        escaped = escape_like(q)
+        exact_key = String.upcase(q)
+        prefix = escaped <> "%"
+        title_pattern = "%" <> escaped <> "%"
 
-      exact = search_exact_key(project_id, exact_key, limit)
-      remaining = limit - length(exact)
+        exact = search_exact_key(project_id, exact_key, limit)
+        remaining = limit - length(exact)
 
-      prefix_hits =
-        if remaining > 0 do
-          search_prefix_key(project_id, prefix, remaining, MapSet.new(Enum.map(exact, & &1.key)))
-        else
-          []
-        end
+        prefix_hits =
+          if remaining > 0 do
+            search_prefix_key(project_id, prefix, remaining, MapSet.new(Enum.map(exact, & &1.key)))
+          else
+            []
+          end
 
-      remaining = limit - length(exact) - length(prefix_hits)
-      known = MapSet.new(Enum.map(exact ++ prefix_hits, & &1.key))
+        remaining = limit - length(exact) - length(prefix_hits)
+        known = MapSet.new(Enum.map(exact ++ prefix_hits, & &1.key))
 
-      title_hits =
-        if remaining > 0 do
-          search_title(project_id, title_pattern, remaining, known, include_desc?)
-        else
-          []
-        end
+        title_hits =
+          if remaining > 0 do
+            search_title(project_id, title_pattern, remaining, known, include_desc?)
+          else
+            []
+          end
 
-      exact ++ prefix_hits ++ title_hits
-    end
+        exact ++ prefix_hits ++ title_hits
+      end
+    end)
   end
 
   @doc """
   Aggregated project status: counts by status + recent items.
   """
-  def status_summary(%Scope{project_id: project_id}, opts \\ []) do
-    recent_limit = Keyword.get(opts, :recent_limit, 10) |> min(50)
+  def status_summary(%Scope{project_id: project_id} = scope, opts \\ []) do
+    tenant(scope, fn ->
+      recent_limit = Keyword.get(opts, :recent_limit, 10) |> min(50)
 
-    %{
-      project_id: project_id,
-      epics_by_status: count_by_status(Epic, project_id),
-      stories_by_status: count_by_status(UserStory, project_id),
-      tickets_by_status: count_by_status(Ticket, project_id),
-      recent: recent_items(project_id, recent_limit),
-      in_review: recent_tickets(project_id, "in_review", recent_limit)
-    }
+      %{
+        project_id: project_id,
+        epics_by_status: count_by_status(Epic, project_id),
+        stories_by_status: count_by_status(UserStory, project_id),
+        tickets_by_status: count_by_status(Ticket, project_id),
+        recent: recent_items(project_id, recent_limit),
+        in_review: recent_tickets(project_id, "in_review", recent_limit)
+      }
+    end)
   end
 
   # --- Search helpers ---

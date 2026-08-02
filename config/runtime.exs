@@ -68,13 +68,100 @@ present? = fn key ->
   end
 end
 
-# Prod defaults to verified SSL (true). Dev/test default verify_none for local/self-signed hosts.
-ssl_default = if config_env() == :prod, do: "true", else: "verify_none"
+# Prod/dev default: verified TLS. Override with DB_SSL=verify_none only for loopback lab.
+ssl_default = "true"
+
+# Decode first CERTIFICATE in a PEM file to DER (for pin / cacerts).
+pem_to_ders = fn path ->
+  path
+  |> File.read!()
+  |> :public_key.pem_decode()
+  |> Enum.flat_map(fn
+    {:Certificate, der, :not_encrypted} -> [der]
+    _ -> []
+  end)
+end
+
+# Self-signed server certs (no CA:true) fail OTP default trust; pin by SHA-256 DER.
+# Accept only if the peer cert fingerprint matches the pinned PEM (anti-MITM).
+ssl_pin_opts = fn ca_path, sni ->
+  ders = pem_to_ders.(ca_path)
+
+  if ders == [] do
+    raise "DB_SSL_CA has no CERTIFICATE entries: #{ca_path}"
+  end
+
+  # Compare decoded OTP certs (DER re-encode is not stable across OTP versions).
+  pinned_otp = Enum.map(ders, &:public_key.pkix_decode_cert(&1, :otp))
+
+  verify_fun = fn
+    cert, {:bad_cert, :selfsigned_peer}, state ->
+      if Enum.any?(pinned_otp, &(&1 == cert)) do
+        {:valid, state}
+      else
+        {:fail, {:bad_cert, :selfsigned_peer}}
+      end
+
+    _cert, {:bad_cert, reason}, _state ->
+      {:fail, reason}
+
+    _cert, {:extension, _}, state ->
+      {:unknown, state}
+
+    _cert, :valid, state ->
+      {:valid, state}
+
+    _cert, :valid_peer, state ->
+      {:valid, state}
+  end
+
+  [
+    verify: :verify_peer,
+    cacerts: ders,
+    depth: 0,
+    verify_fun: {verify_fun, nil},
+    server_name_indication: String.to_charlist(sni),
+    customize_hostname_check: [
+      match_fun: :public_key.pkix_verify_hostname_match_fun(:https)
+    ]
+  ]
+end
 
 ssl_opt =
   case System.get_env("DB_SSL", ssl_default) do
     v when v in ~w(true 1 yes) ->
-      true
+      ca = System.get_env("DB_SSL_CA")
+
+      sni =
+        System.get_env("DB_SSL_HOSTNAME") ||
+          System.get_env("DB_HOST") ||
+          System.get_env("DB_HOSTNAME") ||
+          "localhost"
+
+      cond do
+        is_binary(ca) and ca != "" ->
+          ca_path = Path.expand(ca)
+
+          unless File.exists?(ca_path) do
+            raise """
+            DB_SSL_CA file not found: #{ca_path}
+            Set DB_SSL_CA to a PEM path (self-signed server cert or private CA).
+            """
+          end
+
+          ssl_pin_opts.(ca_path, sni)
+
+        true ->
+          # Public CA roots (Let's Encrypt, commercial CAs, etc.)
+          [
+            verify: :verify_peer,
+            cacerts: :public_key.cacerts_get(),
+            server_name_indication: String.to_charlist(sni),
+            customize_hostname_check: [
+              match_fun: :public_key.pkix_verify_hostname_match_fun(:https)
+            ]
+          ]
+      end
 
     v when v in ~w(false 0 no) ->
       false
@@ -83,7 +170,7 @@ ssl_opt =
       if config_env() == :prod do
         IO.warn("""
         DB_SSL=verify_none in production disables TLS certificate verification (MITM risk).
-        Prefer DB_SSL=true with a trusted CA.
+        Prefer DB_SSL=true with DB_SSL_CA (or system roots for public CAs).
         """)
       end
 
@@ -121,26 +208,44 @@ repo_from_parts = fn ->
           """
     end
 
+  # Never fall back to postgres/postgres/localhost — that can silently hit a real
+  # server with default credentials. Require explicit DB_* (or use DATABASE_URL*).
   missing =
     Enum.reject(
-      [{"DB_USER", username}, {"DB_PASSWORD", password}, {"DB_HOST", hostname}],
+      [
+        {"DB_USER (or DB_USERNAME)", username},
+        {"DB_PASSWORD", password},
+        {"DB_HOST (or DB_HOSTNAME)", hostname}
+      ],
       fn {_k, v} -> is_binary(v) and v != "" end
     )
 
-  if config_env() == :prod and missing != [] do
+  if missing != [] do
     keys = Enum.map_join(missing, ", ", fn {k, _} -> k end)
 
     raise """
     Missing database environment variables: #{keys}
-    Set DATABASE_URL or DB_USER, DB_PASSWORD, DB_HOST, DB_NAME.
+
+    Set discrete vars (loaded from .env by this file, or the shell / platform):
+
+      DB_USER=...
+      DB_PASSWORD=...
+      DB_HOST=...
+      DB_NAME=elx_mcp_dev          # optional in dev (default elx_mcp_dev)
+      DB_NAME_TEST=elx_mcp_test    # optional in test (default elx_mcp_test)
+      DB_PORT=5432                 # optional (default 5432)
+
+    Or a single URL:
+
+      DATABASE_URL=ecto://USER:PASSWORD@HOST:5432/elx_mcp_dev
+      DATABASE_URL_TEST=ecto://USER:PASSWORD@HOST:5432/elx_mcp_test
     """
   end
 
-  # Fallbacks are generic (not project secrets). Prefer .env / env vars.
   [
-    username: username || "postgres",
-    password: password || "postgres",
-    hostname: hostname || "localhost",
+    username: username,
+    password: password,
+    hostname: hostname,
     database: database,
     port: db_port
   ]

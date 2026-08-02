@@ -25,52 +25,62 @@ defmodule ElxMcp.Auth do
     if not Enum.all?(List.wrap(scopes), &(&1 in Catalog.scopes())) do
       {:error, :invalid_scopes}
     else
-      %ApiKey{}
-      |> ApiKey.changeset(Map.put(attrs_map, :email, email))
-      |> Ecto.Changeset.put_change(:project_id, project_id)
-      |> Ecto.Changeset.put_change(:key_hash, hash)
-      |> Ecto.Changeset.put_change(:key_prefix, prefix)
-      |> Ecto.Changeset.put_change(:scopes, List.wrap(scopes))
-      |> Ecto.Changeset.validate_required([:project_id, :key_hash, :key_prefix])
-      |> Repo.insert()
-      |> case do
-        {:ok, api_key} -> {:ok, api_key, plaintext}
-        error -> error
-      end
+      Repo.with_tenant(project_id, fn ->
+        %ApiKey{}
+        |> ApiKey.changeset(Map.put(attrs_map, :email, email))
+        |> Ecto.Changeset.put_change(:project_id, project_id)
+        |> Ecto.Changeset.put_change(:key_hash, hash)
+        |> Ecto.Changeset.put_change(:key_prefix, prefix)
+        |> Ecto.Changeset.put_change(:scopes, List.wrap(scopes))
+        |> Ecto.Changeset.validate_required([:project_id, :key_hash, :key_prefix])
+        |> Repo.insert()
+        |> case do
+          {:ok, api_key} -> {:ok, api_key, plaintext}
+          error -> error
+        end
+      end)
     end
   end
 
   @doc """
   Verifies a hex-encoded API key **and** that it belongs to `email`.
 
-  Email is compared case-insensitively after trim (keys store lowercased email).
-  Returns `{:ok, %Scope{}}` or `{:error, :unauthorized}`.
+  Uses RLS bypass for the lookup (key is the tenant discovery path), then returns Scope.
   """
   def verify_api_key(plaintext, email)
       when is_binary(plaintext) and is_binary(email) do
     normalized_email = normalize_email(email)
 
-    with true <- normalized_email != "",
-         true <- valid_hex_key?(plaintext),
-         {:ok, raw} <- Base.decode16(plaintext, case: :mixed),
-         hash <- :crypto.hash(:sha256, raw),
-         %ApiKey{} = key <- fetch_active_key(hash),
-         true <- is_list(key.scopes) and "project:read" in key.scopes,
-         true <- emails_match?(key.email, normalized_email) do
-      touch_last_used(key)
+    result =
+      Repo.with_bypass(fn ->
+        with true <- normalized_email != "",
+             true <- valid_hex_key?(plaintext),
+             {:ok, raw} <- Base.decode16(plaintext, case: :mixed),
+             hash <- :crypto.hash(:sha256, raw),
+             %ApiKey{} = key <- fetch_active_key(hash),
+             true <- is_list(key.scopes) and "project:read" in key.scopes,
+             true <- emails_match?(key.email, normalized_email) do
+          touch_last_used(key)
 
-      scope = %Scope{
-        project_id: key.project_id,
-        actor_email: key.email,
-        api_key_id: key.id,
-        scopes: key.scopes,
-        key_prefix: key.key_prefix,
-        project: key.project
-      }
+          scope = %Scope{
+            project_id: key.project_id,
+            actor_email: key.email,
+            api_key_id: key.id,
+            scopes: key.scopes,
+            key_prefix: key.key_prefix,
+            project: key.project
+          }
 
-      {:ok, scope}
-    else
-      _ -> {:error, :unauthorized}
+          {:ok, scope}
+        else
+          _ -> {:error, :unauthorized}
+        end
+      end)
+
+    case result do
+      {:ok, {:ok, %Scope{}} = ok} -> ok
+      {:ok, {:error, :unauthorized}} -> {:error, :unauthorized}
+      {:error, _} -> {:error, :unauthorized}
     end
   end
 
@@ -95,22 +105,33 @@ defmodule ElxMcp.Auth do
   end
 
   def revoke_api_key(%ApiKey{} = key) do
-    key
-    |> Ecto.Changeset.change(revoked_at: DateTime.utc_now(:microsecond))
-    |> Repo.update()
+    Repo.with_tenant(key.project_id, fn ->
+      key
+      |> Ecto.Changeset.change(revoked_at: DateTime.utc_now(:microsecond))
+      |> Repo.update()
+    end)
   end
 
-  def get_api_key!(id), do: Repo.get!(ApiKey, id)
+  def get_api_key!(id) do
+    {:ok, key} =
+      Repo.with_bypass(fn ->
+        Repo.get!(ApiKey, id)
+      end)
+
+    key
+  end
 
   def list_api_keys(project_id, opts \\ []) do
     limit = Keyword.get(opts, :limit, 50) |> min(200)
 
-    Repo.all(
-      from k in ApiKey,
-        where: k.project_id == ^project_id,
-        order_by: [desc: k.inserted_at],
-        limit: ^limit
-    )
+    Repo.with_tenant(project_id, fn ->
+      Repo.all(
+        from k in ApiKey,
+          where: k.project_id == ^project_id,
+          order_by: [desc: k.inserted_at],
+          limit: ^limit
+      )
+    end)
   end
 
   defp valid_hex_key?(key), do: Regex.match?(~r/\A[0-9a-fA-F]{64}\z/, key)

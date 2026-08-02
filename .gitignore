@@ -2,7 +2,12 @@
 .env
 .env.local
 .env.*.local
+.aquental_db_credentials
 .mcp.config
+
+# Encrypted logical backups (still secrets — never commit)
+/priv/backups/
+/tmp/backups/
 
 # The directory Mix will write compiled artifacts to.
 /_build/

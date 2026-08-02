@@ -1,0 +1,100 @@
+# CI — Option C (GitHub Actions Secrets)
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   DB_PASSWORD       — password for the CI Postgres role (also used by the service container)
+#   SECRET_KEY_BASE   — optional for tests; generated if unset via fallback below
+#
+# Optional:
+#   ELX_MCP_BACKUP_PASSPHRASE — only if a future job runs mix db.backup
+#
+# DB host is the workflow service container (localhost), not hermes — runners cannot use
+# the hermes pg_hba allowlist. Production hermes credentials stay out of CI.
+#
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  MIX_ENV: test
+  LANG: C.UTF-8
+  # Discrete DB_* required by config/runtime.exs (no postgres/postgres fallbacks)
+  DB_USER: elx_mcp_dev
+  DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+  DB_HOST: localhost
+  DB_PORT: "5432"
+  DB_NAME: elx_mcp_dev
+  DB_NAME_TEST: elx_mcp_test
+  # CI Postgres has no TLS listener — do not use verify-full here
+  DB_SSL: "false"
+  POOL_SIZE: "10"
+
+jobs:
+  test:
+    name: mix test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: elx_mcp_dev
+          POSTGRES_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          POSTGRES_DB: elx_mcp_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U elx_mcp_dev -d elx_mcp_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Require DB_PASSWORD secret
+        run: |
+          if [ -z "${{ secrets.DB_PASSWORD }}" ]; then
+            echo "::error::Repository secret DB_PASSWORD is not set."
+            echo "Create it under Settings → Secrets and variables → Actions."
+            echo "Example: gh secret set DB_PASSWORD"
+            exit 1
+          fi
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.18"
+          otp-version: "27"
+
+      - name: Cache deps and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-${{ hashFiles('**/mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Compile (warnings as errors)
+        run: mix compile --warnings-as-errors
+
+      - name: Check formatting
+        run: mix format --check-formatted
+
+      - name: Create DBs and run tests
+        run: |
+          # config/test.exs provides endpoint secret_key_base; runtime.exs only requires
+          # SECRET_KEY_BASE in :prod. Optional repo secret SECRET_KEY_BASE is unused here.
+          mix ecto.create --quiet
+          mix ecto.migrate --quiet
+          mix test

@@ -8,39 +8,65 @@ defmodule ElxMcp.Tenancy do
   alias ElxMcp.Tenancy.Project
 
   def list_projects do
-    Repo.all(from p in Project, order_by: [asc: p.key])
+    {:ok, projects} =
+      Repo.with_bypass(fn ->
+        Repo.all(from p in Project, order_by: [asc: p.key])
+      end)
+
+    projects
   end
 
-  def get_project!(id), do: Repo.get!(Project, id)
+  def get_project!(id) do
+    {:ok, project} =
+      Repo.with_bypass(fn ->
+        Repo.get!(Project, id)
+      end)
+
+    project
+  end
 
   def get_project_by_key(key) when is_binary(key) do
-    Repo.get_by(Project, key: String.upcase(key))
+    {:ok, project} =
+      Repo.with_bypass(fn ->
+        Repo.get_by(Project, key: String.upcase(key))
+      end)
+
+    project
   end
 
   def create_project(attrs) do
-    %Project{}
-    |> Project.changeset(attrs)
-    |> Repo.insert()
+    id = Ecto.UUID.generate()
+
+    changeset =
+      %Project{id: id}
+      |> Project.changeset(attrs)
+
+    # RLS: GUC must match projects.id for INSERT
+    Repo.with_tenant(id, fn ->
+      Repo.insert(changeset)
+    end)
   end
 
   @doc """
   Atomically increments `issue_counter` and returns `{project_key}-{n}`.
   """
   def next_issue_key(project_id) do
-    Repo.transaction(fn ->
-      project =
-        Project
-        |> where([p], p.id == ^project_id)
-        |> lock("FOR UPDATE")
-        |> Repo.one!()
+    Repo.with_tenant(project_id, fn ->
+      Repo.transaction(fn ->
+        project =
+          Project
+          |> where([p], p.id == ^project_id)
+          |> lock("FOR UPDATE")
+          |> Repo.one!()
 
-      n = project.issue_counter + 1
+        n = project.issue_counter + 1
 
-      project
-      |> Ecto.Changeset.change(issue_counter: n)
-      |> Repo.update!()
+        project
+        |> Ecto.Changeset.change(issue_counter: n)
+        |> Repo.update!()
 
-      "#{project.key}-#{n}"
+        "#{project.key}-#{n}"
+      end)
     end)
   end
 end

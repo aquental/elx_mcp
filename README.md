@@ -314,13 +314,15 @@ O `config/runtime.exs` **carrega `.env` automaticamente** (sem sobrescrever vari
 
 ```bash
 # .env
-DB_USER=your_db_user
-DB_PASSWORD=your_db_password
+DB_USER=elx_mcp_dev
+DB_PASSWORD=your_strong_db_password
 DB_HOST=your_db_host
-DB_PORT=5432
+DB_PORT=5481
 DB_NAME=elx_mcp_dev
 DB_NAME_TEST=elx_mcp_test
-DB_SSL=verify_none
+DB_SSL=true
+DB_SSL_CA=priv/certs/hermes-pg-ca.pem
+DB_SSL_HOSTNAME=vps8383.panel.icontainer.net
 POOL_SIZE=10
 ```
 
@@ -329,21 +331,45 @@ POOL_SIZE=10
 | `DB_USER` | usuário Postgres |
 | `DB_PASSWORD` | senha |
 | `DB_HOST` | servidor (ex.: `localhost`, hostname da sua rede) |
-| `DB_PORT` | porta (padrão `5432`) |
+| `DB_PORT` | porta (padrão app `5432`; cluster hermes ElxMCP: **`5481`**) |
 | `DB_NAME` | database em dev |
 | `DB_NAME_TEST` | database em test (padrão `elx_mcp_test`) |
-| `DB_SSL` | `true` \| `false` \| `verify_none` |
+| `DB_SSL` | `true` (peer verify) \| `false` \| `verify_none` (só lab) |
+| `DB_SSL_CA` | PEM do CA/cert pin (hermes: `priv/certs/hermes-pg-ca.pem`) |
+| `DB_SSL_HOSTNAME` | nome no certificado TLS se `DB_HOST` for alias |
 
 ### Ou uma URL única
 
 ```bash
-DATABASE_URL=ecto://USER:PASSWORD@HOST:5432/elx_mcp_dev
-DATABASE_URL_TEST=ecto://USER:PASSWORD@HOST:5432/elx_mcp_test
+DATABASE_URL=ecto://USER:PASSWORD@HOST:5481/elx_mcp_dev
+DATABASE_URL_TEST=ecto://USER:PASSWORD@HOST:5481/elx_mcp_test
 ```
 
 Se `DATABASE_URL` estiver definida, ela tem prioridade em dev/prod. Em test, usa-se `DATABASE_URL_TEST` se existir; senão, as vars `DB_*` + `DB_NAME_TEST`.
 
 Template: [`.env.example`](.env.example). Valores locais: `.env` (não versionado).
+
+### CI (GitHub Actions Secrets)
+
+Workflow: [`.github/workflows/ci.yml`](.github/workflows/ci.yml).  
+Secrets: [`.github/SECRETS.md`](.github/SECRETS.md).
+
+```bash
+# one-time
+openssl rand -base64 24 | tr -d '/+=' | gh secret set DB_PASSWORD
+# push to main / open PR → Actions runs mix test against Postgres service
+```
+
+### Backup cifrado do Postgres
+
+```bash
+# Requer ELX_MCP_BACKUP_PASSPHRASE no .env
+mix db.backup                 # priv/backups/*.dump.gpg (AES-256)
+mix db.backup.verify          # decrypt → DB temp → verifica tabelas → DROP
+./scripts/db_backup.sh --db both
+```
+
+Arquivos em `priv/backups/` (gitignored). Detalhes de segurança: [`spec/DB_SEC.md`](spec/DB_SEC.md).
 
 ## Configuração rápida
 

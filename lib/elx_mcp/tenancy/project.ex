@@ -2,6 +2,7 @@ defmodule ElxMcp.Tenancy.Project do
   use Ecto.Schema
   import Ecto.Changeset
 
+  # autogenerate false when caller pre-assigns id for RLS GUC alignment (see Tenancy.create_project)
   @primary_key {:id, :binary_id, autogenerate: true}
   @foreign_key_type :binary_id
   @timestamps_opts [type: :utc_datetime_usec]
